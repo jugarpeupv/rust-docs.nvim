@@ -5,6 +5,7 @@ local M = {}
 --- Kind to highlight group mapping for display.
 local KIND_HL = {
   ["fn"]             = "Function",
+  ["method"]         = "Function",
   ["struct"]         = "Structure",
   ["enum"]           = "Type",
   ["trait"]          = "Interface",

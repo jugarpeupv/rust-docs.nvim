@@ -183,7 +183,7 @@ local function parse_and_cache(json_path, callback)
   --   - Items without a resolved std path are skipped (internal/private items).
   local out_path = cache_path()
   local script = string.format([[
-import json
+import json, os, re
 
 with open(%q) as f:
     data = json.load(f)
@@ -205,9 +205,13 @@ KIND_LABEL = {
     "variant": "variant", "struct_field": "struct field",
 }
 BASE_URL = %q
+HTML_BASE = os.path.join(os.path.dirname(os.path.dirname(%q)), "html")  # <sysroot>/share/doc/rust/html
 
 # Items whose kind has no standalone doc page (skip from picker)
 SKIP_KINDS = {"impl", "use", "struct_field", "variant", "assoc_type", "assoc_const"}
+
+# Kinds whose HTML pages may contain #method.* anchors worth indexing
+METHOD_PARENT_KINDS = {"struct", "enum", "trait", "primitive", "type_alias"}
 
 # ---- Build public re-export paths from 'use' items ----
 # The paths[] dict uses internal module paths; re-exports give us the public path.
@@ -249,9 +253,11 @@ for item_id, item in index.items():
     if current is None or len(pub_path) < len(current):
         public_paths[target_id] = pub_path
 
-# ---- Extract items ----
+# ---- Extract top-level items ----
 items = []
 seen_full_paths = set()
+# parent_url -> (full_path, kind_key) for method extraction pass
+method_parents = []
 
 for item_id, item in index.items():
     if not item.get("name"):
@@ -305,11 +311,57 @@ for item_id, item in index.items():
         "url":       url,
     })
 
+    if kind_key in METHOD_PARENT_KINDS and type_seg and type_seg != "index":
+        method_parents.append((full_path, url))
+
+# ---- Extract methods from local HTML pages ----
+# The rustdoc JSON does not include methods from re-exported foreign crate types
+# (e.g. sort_by on [T] comes from alloc but is documented under std::primitive::slice).
+# Parsing #method.* anchors from the local HTML is the most complete source.
+
+METHOD_ANCHOR = re.compile(r'id="method\.([^"]+)"')
+
+def url_to_html_path(url):
+    # https://doc.rust-lang.org/std/net/struct.TcpListener.html
+    #   -> <html_base>/std/net/struct.TcpListener.html
+    suffix = url.replace("https://doc.rust-lang.org/", "")
+    return os.path.join(HTML_BASE, suffix)
+
+for parent_full_path, parent_url in method_parents:
+    html_path = url_to_html_path(parent_url)
+    if not os.path.exists(html_path):
+        continue
+    try:
+        with open(html_path, encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except OSError:
+        continue
+
+    seen_methods = set()
+    for method_name in METHOD_ANCHOR.findall(content):
+        # Deduplicate; strip numeric suffix used for overloads (e.g. sort_floats-1)
+        base_name = method_name.split("-")[0] if method_name[-1].isdigit() and "-" in method_name else method_name
+        if base_name in seen_methods:
+            continue
+        seen_methods.add(base_name)
+        full_path = parent_full_path + "::" + base_name
+        if full_path in seen_full_paths:
+            continue
+        seen_full_paths.add(full_path)
+        items.append({
+            "name":      base_name,
+            "path":      parent_full_path,
+            "full_path": full_path,
+            "kind":      "method",
+            "desc":      "",
+            "url":       parent_url + "#method." + base_name,
+        })
+
 with open(%q, "w") as f:
     json.dump(items, f, separators=(",", ":"))
 
 print(len(items))
-]], json_path, config.options.base_url, out_path)
+]], json_path, config.options.base_url, json_path, out_path)
 
   -- Write script to a temp file to avoid shell quoting issues
   local script_path = config.options.cache_dir .. "/parse_index.py"

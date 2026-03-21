@@ -3,6 +3,22 @@
 
 local M = {}
 
+--- Kind to highlight group mapping for display.
+local KIND_HL = {
+  ["fn"]        = "Function",
+  ["method"]    = "Function",
+  ["struct"]    = "Structure",
+  ["enum"]      = "Type",
+  ["trait"]     = "Interface",
+  ["mod"]       = "Namespace",
+  ["const"]     = "Constant",
+  ["static"]    = "Constant",
+  ["typedef"]   = "Type",
+  ["macro"]     = "Macro",
+  ["primitive"] = "Type",
+  ["keyword"]   = "Keyword",
+}
+
 --- Open the Snacks picker with the given list of items.
 ---@param items RustDocs.Item[]
 function M.open(items)
@@ -40,7 +56,8 @@ function M.open(items)
 
       -- Kind badge
       local kind_str = string.format("%-18s", "[" .. entry.kind .. "]")
-      table.insert(parts, { kind_str, hl = "SnacksPickerLabel" })
+      local kind_hl = KIND_HL[entry.kind] or "SnacksPickerLabel"
+      table.insert(parts, { kind_str, hl = kind_hl })
       table.insert(parts, { "  " })
 
       -- Full path
