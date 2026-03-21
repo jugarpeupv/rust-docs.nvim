@@ -8,8 +8,14 @@ local config  = require("rust-docs.config")
 local fetch   = require("rust-docs.search.fetch")
 local render  = require("rust-docs.render.html")
 
---- Section navigation pattern — lines starting with the separator char.
-local SECTION_SEPARATOR = "─"
+--- Section navigation pattern — the separator line starts with ─ (U+2500),
+--- which is the 3-byte UTF-8 sequence \xe2\x94\x80.
+local SECTION_SEP_BYTES = "\xe2\x94\x80"
+
+--- Return true if a line is a separator line.
+local function is_sep(line)
+  return line ~= nil and line:sub(1, 3) == SECTION_SEP_BYTES
+end
 
 --- Return the buffer name for an item.
 ---@param full_path string  e.g. "std::net::TcpListener"
@@ -51,24 +57,30 @@ local function set_keymaps(buf, url)
   local km = config.options.keymaps
   local opts = { buffer = buf, silent = true, noremap = true }
 
-  -- Jump to next section separator
+  -- Jump to next section title (non-blank line immediately after an opening separator)
   vim.keymap.set("n", km.section_next, function()
     local cur = vim.api.nvim_win_get_cursor(0)[1]
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     for i = cur + 1, #lines do
-      if lines[i]:sub(1, 1) == SECTION_SEPARATOR then
+      if not is_sep(lines[i])
+        and lines[i] ~= ""
+        and is_sep(lines[i - 1])
+      then
         vim.api.nvim_win_set_cursor(0, { i, 0 })
         return
       end
     end
   end, vim.tbl_extend("force", opts, { desc = "rust-docs: next section" }))
 
-  -- Jump to previous section separator
+  -- Jump to previous section title
   vim.keymap.set("n", km.section_prev, function()
     local cur = vim.api.nvim_win_get_cursor(0)[1]
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     for i = cur - 1, 1, -1 do
-      if lines[i]:sub(1, 1) == SECTION_SEPARATOR then
+      if not is_sep(lines[i])
+        and lines[i] ~= ""
+        and is_sep(lines[i - 1])
+      then
         vim.api.nvim_win_set_cursor(0, { i, 0 })
         return
       end
@@ -119,7 +131,8 @@ local function create_buf(name, url)
   vim.api.nvim_buf_set_name(buf, name)
 
   -- Buffer options
-  vim.bo[buf].filetype    = "markdown"
+  vim.bo[buf].filetype    = "rust-docs"
+  vim.bo[buf].syntax      = "markdown"
   vim.bo[buf].buftype     = "nofile"
   vim.bo[buf].swapfile    = false
   vim.bo[buf].modifiable  = false
