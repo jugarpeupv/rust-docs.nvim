@@ -8,14 +8,14 @@ local config  = require("rust-docs.config")
 local fetch   = require("rust-docs.search.fetch")
 local render  = require("rust-docs.render.html")
 
---- Section navigation pattern — the separator line starts with ─ (U+2500),
---- which is the 3-byte UTF-8 sequence \xe2\x94\x80.
-local SECTION_SEP_BYTES = "\xe2\x94\x80"
-
---- Return true if a line is a separator line.
-local function is_sep(line)
-  return line ~= nil and line:sub(1, 3) == SECTION_SEP_BYTES
+--- Return true if a line is a markdown heading (starts with one or more #).
+local function is_heading(line)
+  return line ~= nil and line:match("^#+ ")
 end
+
+--- Module-level cache: buf_number → link_map ({ [line_nr] = url })
+--- Using a plain Lua table so integer keys are preserved (vim.b doesn't allow that).
+local buf_link_maps = {}
 
 --- Return the buffer name for an item.
 ---@param full_path string  e.g. "std::net::TcpListener"
@@ -54,33 +54,27 @@ end
 ---@param buf integer
 ---@param url string  Source URL for gx
 local function set_keymaps(buf, url)
-  local km = config.options.keymaps
+  local km   = config.options.keymaps
   local opts = { buffer = buf, silent = true, noremap = true }
 
-  -- Jump to next section title (non-blank line immediately after an opening separator)
+  -- Jump to next markdown heading
   vim.keymap.set("n", km.section_next, function()
     local cur = vim.api.nvim_win_get_cursor(0)[1]
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     for i = cur + 1, #lines do
-      if not is_sep(lines[i])
-        and lines[i] ~= ""
-        and is_sep(lines[i - 1])
-      then
+      if is_heading(lines[i]) then
         vim.api.nvim_win_set_cursor(0, { i, 0 })
         return
       end
     end
   end, vim.tbl_extend("force", opts, { desc = "rust-docs: next section" }))
 
-  -- Jump to previous section title
+  -- Jump to previous markdown heading
   vim.keymap.set("n", km.section_prev, function()
     local cur = vim.api.nvim_win_get_cursor(0)[1]
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
     for i = cur - 1, 1, -1 do
-      if not is_sep(lines[i])
-        and lines[i] ~= ""
-        and is_sep(lines[i - 1])
-      then
+      if is_heading(lines[i]) then
         vim.api.nvim_win_set_cursor(0, { i, 0 })
         return
       end
@@ -101,6 +95,23 @@ local function set_keymaps(buf, url)
     vim.notify("rust-docs: opened in browser", vim.log.levels.INFO)
   end, vim.tbl_extend("force", opts, { desc = "rust-docs: open in browser" }))
 
+  -- Follow link under cursor (gd, configurable)
+  local go_key = km.go_to_doc or "gd"
+  vim.keymap.set("n", go_key, function()
+    local cur_line = vim.api.nvim_win_get_cursor(0)[1]
+    local lmap = buf_link_maps[buf]
+    local target_url = lmap and lmap[cur_line]
+    if not target_url then
+      vim.notify("rust-docs: no link on this line", vim.log.levels.INFO)
+      return
+    end
+    -- Derive a display name from the URL path (last two segments)
+    local display = target_url:match("/([^/]+/[^/]+)$") or target_url:match("/([^/]+)$") or target_url
+    -- Strip trailing .html
+    display = display:gsub("%.html$", ""):gsub("/", "::")
+    M.open_url(target_url, display)
+  end, vim.tbl_extend("force", opts, { desc = "rust-docs: follow link to doc page" }))
+
   -- Reload (re-fetch)
   vim.keymap.set("n", "R", function()
     M.reload(buf)
@@ -112,14 +123,17 @@ local function set_keymaps(buf, url)
   end, vim.tbl_extend("force", opts, { desc = "rust-docs: close" }))
 end
 
---- Write lines into the buffer (handles modifiable flag).
+--- Write lines into the buffer and update the link map.
 ---@param buf integer
 ---@param lines string[]
-local function write_lines(buf, lines)
+---@param link_map table<integer,string>|nil
+local function write_lines(buf, lines, link_map)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  vim.bo[buf].modified = false
+  vim.bo[buf].modified   = false
+  -- Update the link map (clear old, set new)
+  buf_link_maps[buf] = link_map or {}
 end
 
 --- Create a new doc buffer (not yet populated).
@@ -139,10 +153,31 @@ local function create_buf(name, url)
   vim.bo[buf].readonly    = false  -- we manage modifiable manually
   vim.bo[buf].buflisted   = true
 
+  -- Enable markdown-heading folds (window-local, set when buffer is displayed)
+  vim.api.nvim_create_autocmd("BufWinEnter", {
+    buffer  = buf,
+    once    = true,
+    callback = function()
+      for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+        vim.wo[win].foldmethod = "expr"
+        vim.wo[win].foldexpr   = "v:lua.vim.treesitter.foldexpr()"
+        vim.wo[win].foldenable = true
+        vim.wo[win].foldlevel  = 99  -- start with all folds open
+      end
+    end,
+  })
+
   set_keymaps(buf, url)
 
   -- Store metadata as buffer variable
   vim.b[buf].rust_docs_url = url
+
+  -- Clean up link map when buffer is deleted
+  vim.api.nvim_buf_attach(buf, false, {
+    on_detach = function()
+      buf_link_maps[buf] = nil
+    end,
+  })
 
   return buf
 end
@@ -158,6 +193,47 @@ local function show_loading(buf, item)
     "",
     "(press R to reload)",
   })
+end
+
+--- Open a doc buffer for a raw URL (e.g. a crate's index page).
+--- The buffer is named "rust-docs://<display_name>".
+---@param url string
+---@param display_name string   Used as the buffer name suffix (e.g. "serde_json 1.0.149")
+function M.open_url(url, display_name)
+  local name = buf_name(display_name)
+  local buf  = find_buf(name)
+  local is_new = buf == nil
+
+  if is_new then
+    buf = create_buf(name, url)
+  end
+
+  show_buf(buf)
+
+  if not is_new then
+    local line_count = vim.api.nvim_buf_line_count(buf)
+    if line_count > 5 then return end
+  end
+
+  write_lines(buf, { "# " .. display_name, "", "Loading " .. url .. " …" })
+
+  fetch.fetch(url, function(err, html)
+    if err then
+      write_lines(buf, { "# Error", "", err, "", "Press R to retry." })
+      return
+    end
+    local ok, lines, link_map = pcall(render.render, html, url)
+    if not ok then
+      -- pcall packs error into `lines` when it fails
+      write_lines(buf, { "# Render error", "", tostring(lines) })
+      return
+    end
+    write_lines(buf, lines, link_map)
+    local wins = vim.fn.win_findbuf(buf)
+    for _, win in ipairs(wins) do
+      vim.api.nvim_win_set_cursor(win, { 1, 0 })
+    end
+  end)
 end
 
 --- Open a doc buffer for the given item. Creates or reuses an existing buffer.
@@ -188,7 +264,6 @@ function M.open(item)
   -- Fetch the doc page
   fetch.fetch(item.url, function(err, html)
     if err then
-      vim.bo[buf].modifiable = true
       write_lines(buf, {
         "# Error loading " .. item.full_path,
         "",
@@ -199,7 +274,7 @@ function M.open(item)
       return
     end
 
-    local ok, lines = pcall(render.render, html, item.url)
+    local ok, lines, link_map = pcall(render.render, html, item.url)
     if not ok then
       write_lines(buf, {
         "# Render error for " .. item.full_path,
@@ -209,7 +284,7 @@ function M.open(item)
       return
     end
 
-    write_lines(buf, lines)
+    write_lines(buf, lines, link_map)
     -- Jump to top
     local wins = vim.fn.win_findbuf(buf)
     for _, win in ipairs(wins) do
@@ -227,24 +302,19 @@ function M.reload(buf)
     return
   end
 
-  local placeholder = {
-    "Reloading...",
-    "",
-    url,
-  }
-  write_lines(buf, placeholder)
+  write_lines(buf, { "Reloading...", "", url })
 
   fetch.fetch(url, function(err, html)
     if err then
       write_lines(buf, { "Error: " .. err })
       return
     end
-    local ok, lines = pcall(render.render, html, url)
+    local ok, lines, link_map = pcall(render.render, html, url)
     if not ok then
       write_lines(buf, { "Render error: " .. tostring(lines) })
       return
     end
-    write_lines(buf, lines)
+    write_lines(buf, lines, link_map)
   end)
 end
 

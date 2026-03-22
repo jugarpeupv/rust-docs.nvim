@@ -3,6 +3,24 @@
 
 local M = {}
 
+-- ---------------------------------------------------------------------------
+-- Session memory
+-- ---------------------------------------------------------------------------
+
+--- The last source the user picked in this Neovim session.
+--- @type { kind: "std" } | { kind: "crate", crate: RustDocs.Crate, version: string } | nil
+M._last_source = nil
+
+--- Forget the remembered source so the next M.open() shows the source picker.
+function M.clear_source()
+  M._last_source = nil
+  vim.notify("rust-docs: source cleared — next open will show source picker", vim.log.levels.INFO)
+end
+
+-- ---------------------------------------------------------------------------
+-- Helpers
+-- ---------------------------------------------------------------------------
+
 --- Detect which picker backend is available.
 ---@return "telescope"|"snacks"|nil
 local function detect_picker()
@@ -19,30 +37,240 @@ local function detect_picker()
   return nil
 end
 
---- Open the fuzzy picker. Fetches the search index if needed (cached after first load).
-function M.open()
-  local index = require("rust-docs.search.index")
-  index.get_items(function(err, items)
-    if err then
-      vim.notify(err, vim.log.levels.ERROR)
+--- Build a human-readable label for the current remembered source.
+---@return string
+local function source_label()
+  local src = M._last_source
+  if not src then return "" end
+  if src.kind == "std" then return "std" end
+  return src.crate.name .. " " .. src.version
+end
+
+--- Kind priority for item ordering: lower = appears first.
+--- Types (struct, enum, trait, …) come before callables (fn, method, …).
+local KIND_PRIORITY = {
+  mod       = 1,
+  struct    = 2,
+  enum      = 3,
+  trait     = 4,
+  typedef   = 5,
+  primitive = 6,
+  macro     = 7,
+  const     = 8,
+  static    = 9,
+  fn        = 10,
+  method    = 11,
+}
+
+--- Dispatch items to the fuzzy item picker.
+--- `index_url` is the crate's root HTML page (nil for std).
+---@param items RustDocs.Item[]
+---@param index_url string|nil
+local function open_items_picker(items, index_url)
+  -- Sort: by kind priority first, then alphabetically by full_path
+  local sorted = vim.deepcopy(items)
+  table.sort(sorted, function(a, b)
+    local pa = KIND_PRIORITY[a.kind] or 99
+    local pb = KIND_PRIORITY[b.kind] or 99
+    if pa ~= pb then return pa < pb end
+    return a.full_path < b.full_path
+  end)
+
+  local backend = detect_picker()
+  local title   = "Rust Docs — " .. source_label()
+  if backend == "telescope" then
+    require("rust-docs.pickers.telescope").open(sorted, title, index_url)
+  elseif backend == "snacks" then
+    require("rust-docs.pickers.snacks").open(sorted, title, index_url)
+  else
+    vim.notify(
+      "rust-docs: no picker found. Install telescope.nvim or snacks.nvim",
+      vim.log.levels.ERROR
+    )
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Crate flow
+-- ---------------------------------------------------------------------------
+
+--- Open the items picker for an external crate.
+--- Skips the version picker if a version is already remembered or if
+--- prompt_version = false.
+---@param crate RustDocs.Crate
+---@param forced_version string|nil  Pass a version to skip the picker
+function M.open_crate(crate, forced_version)
+  local cfg       = require("rust-docs.config").options
+  local crate_mod = require("rust-docs.search.crates")
+
+  local function load_version(version)
+    -- Remember this choice for the rest of the session
+    M._last_source = { kind = "crate", crate = crate, version = version }
+
+    crate_mod.get_crate_items(crate.name, version, function(err, items)
+      if err then
+        vim.notify(err, vim.log.levels.ERROR)
+        return
+      end
+      local index_url = "https://docs.rs/" .. crate.name .. "/" .. version .. "/" .. crate.name .. "/"
+      open_items_picker(items, index_url)
+    end)
+  end
+
+  -- If a version was already decided (session memory or caller), skip the picker
+  if forced_version then
+    load_version(forced_version)
+    return
+  end
+
+  if not cfg.prompt_version then
+    load_version("latest")
+    return
+  end
+
+  -- Fetch available versions, then show version picker
+  crate_mod.get_versions(crate.name, function(err, versions)
+    if err or not versions or #versions == 0 then
+      vim.notify(
+        "rust-docs: could not fetch versions for " .. crate.name .. ", using latest",
+        vim.log.levels.WARN
+      )
+      load_version("latest")
       return
     end
 
     local backend = detect_picker()
     if backend == "telescope" then
-      require("rust-docs.pickers.telescope").open(items)
+      require("rust-docs.pickers.telescope").open_version(crate, versions, load_version)
     elseif backend == "snacks" then
-      require("rust-docs.pickers.snacks").open(items)
-    else
-      vim.notify(
-        "rust-docs: no picker found. Install telescope.nvim or snacks.nvim",
-        vim.log.levels.ERROR
-      )
+      require("rust-docs.pickers.snacks").open_version(crate, versions, load_version)
     end
   end)
 end
 
---- Force refresh of the cached search index, then open the picker.
+-- ---------------------------------------------------------------------------
+-- Source picker
+-- ---------------------------------------------------------------------------
+
+--- Open the source picker (std + pinned crates + crates.io search).
+--- Selecting std opens the std items picker directly.
+--- Selecting a crate or searching opens the crate flow.
+function M.open_source_picker()
+  local cfg = require("rust-docs.config").options
+
+  ---@return RustDocs.Source[]
+  local function build_sources()
+    ---@type RustDocs.Source[]
+    local sources = {
+      { kind = "std", label = "std  —  Rust Standard Library" },
+    }
+    for _, name in ipairs(cfg.pinned_crates or {}) do
+      table.insert(sources, {
+        kind  = "crate",
+        label = name,
+        crate = { name = name, version = "latest", description = "", downloads = 0 },
+      })
+    end
+    table.insert(sources, {
+      kind  = "search",
+      label = "Search crates.io…",
+    })
+    return sources
+  end
+
+  local sources = build_sources()
+  local backend = detect_picker()
+
+  if backend == "telescope" then
+    require("rust-docs.pickers.telescope").open_source(sources, function(source)
+      M._handle_source(source)
+    end)
+  elseif backend == "snacks" then
+    require("rust-docs.pickers.snacks").open_source(sources, function(source)
+      M._handle_source(source)
+    end)
+  else
+    vim.notify(
+      "rust-docs: no picker found. Install telescope.nvim or snacks.nvim",
+      vim.log.levels.ERROR
+    )
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Main entry point (respects session memory)
+-- ---------------------------------------------------------------------------
+
+--- Open rust-docs. If a source is remembered from this session, jump directly
+--- to the item picker for that source. Otherwise show the source picker.
+function M.open()
+  local src = M._last_source
+
+  if src == nil then
+    -- No memory yet — show source picker
+    M.open_source_picker()
+    return
+  end
+
+  if src.kind == "std" then
+    local index = require("rust-docs.search.index")
+    index.get_items(function(err, items)
+      if err then
+        vim.notify(err, vim.log.levels.ERROR)
+        return
+      end
+      open_items_picker(items, nil)
+    end)
+    return
+  end
+
+  if src.kind == "crate" then
+    -- Re-use remembered crate + version, skip all pickers
+    M.open_crate(src.crate, src.version)
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Internal: handle a selected source entry
+-- ---------------------------------------------------------------------------
+
+---@param source RustDocs.Source
+function M._handle_source(source)
+  if source.kind == "std" then
+    -- Remember std as the session source
+    M._last_source = { kind = "std" }
+
+    local index = require("rust-docs.search.index")
+    index.get_items(function(err, items)
+      if err then
+        vim.notify(err, vim.log.levels.ERROR)
+        return
+      end
+      open_items_picker(items, nil)
+    end)
+
+  elseif source.kind == "crate" then
+    M.open_crate(source.crate, nil)
+
+  elseif source.kind == "search" then
+    local backend = detect_picker()
+    if backend == "telescope" then
+      require("rust-docs.pickers.telescope").open_crate_search(function(crate)
+        M.open_crate(crate, nil)
+      end)
+    elseif backend == "snacks" then
+      require("rust-docs.pickers.snacks").open_crate_search(function(crate)
+        M.open_crate(crate, nil)
+      end)
+    end
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Refresh
+-- ---------------------------------------------------------------------------
+
+--- Force refresh of the std cached search index, then open the picker.
 function M.refresh()
   local index = require("rust-docs.search.index")
   index.refresh(function(err)
@@ -54,36 +282,42 @@ function M.refresh()
   end)
 end
 
---- Setup the plugin with user configuration.
+-- ---------------------------------------------------------------------------
+-- Setup
+-- ---------------------------------------------------------------------------
+
 ---@param opts? RustDocs.Config
 function M.setup(opts)
   require("rust-docs.config").setup(opts)
 
   local config = require("rust-docs.config").options
 
-  -- Register the global keymap
+  -- `open` keymap — respects session memory
   if config.keymaps.open and config.keymaps.open ~= "" then
     vim.keymap.set("n", config.keymaps.open, M.open, {
-      desc    = "rust-docs: open picker",
+      desc    = "rust-docs: open picker (remembers last source)",
       silent  = true,
       noremap = true,
     })
   end
 
-  -- Register user commands
+  -- User commands
   vim.api.nvim_create_user_command("RustDocs", function(args)
     local sub = args.args:match("^(%S+)")
     if sub == "refresh" then
       M.refresh()
+    elseif sub == "source" then
+      M.clear_source()
+      M.open_source_picker()
     else
       M.open()
     end
   end, {
     nargs = "?",
     complete = function()
-      return { "refresh" }
+      return { "refresh", "source" }
     end,
-    desc = "Open Rust documentation picker (or :RustDocs refresh to re-download index)",
+    desc = "Open Rust docs picker (:RustDocs source to reset, :RustDocs refresh to rebuild std index)",
   })
 end
 

@@ -28,6 +28,15 @@ local M = {}
 local function strip_tags(s)
   -- Remove button elements entirely (e.g. "Copy item path" in h1)
   s = s:gsub("<button[^>]*>.-</button>", "")
+  -- Headings → markdown (before generic tag removal)
+  s = s:gsub("<h3[^>]*>(.-)</h3>", function(inner)
+    inner = inner:gsub("<[^>]+>", ""):gsub("\xC2\xA7", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    return "\n### " .. inner .. "\n"
+  end)
+  s = s:gsub("<h2[^>]*>(.-)</h2>", function(inner)
+    inner = inner:gsub("<[^>]+>", ""):gsub("\xC2\xA7", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    return "\n## " .. inner .. "\n"
+  end)
   -- Block-level tags → newlines
   s = s:gsub("</p>",   "\n")
   s = s:gsub("</li>",  "\n")
@@ -81,7 +90,46 @@ local function extract_title(html)
   return ""
 end
 
---- Extract the main description docblock.
+--- Extract the item declaration/signature from <pre class="rust item-decl">.
+--- This gives the full pub fn / pub struct / pub enum signature with where clauses.
+---@param html string
+---@return string   empty string if not found
+local function extract_signature(html)
+  -- Match the entire <pre class="rust item-decl">...</pre> block
+  local pre_s, pre_e = html:find('<pre[^>]+class="[^"]*item%-decl[^"]*"[^>]*>')
+  if not pre_s then return "" end
+  local close_s = html:find("</pre>", pre_e)
+  if not close_s then return "" end
+  local inner = html:sub(pre_e + 1, close_s - 1)
+  -- Strip tags but preserve newlines that come from <br> / <div class="where">
+  inner = inner:gsub('<div[^>]*class="[^"]*where[^"]*"[^>]*>', "\n")
+  inner = inner:gsub("</div>", "")
+  inner = inner:gsub("<br%s*/?>", "\n")
+  inner = inner:gsub("<[^>]+>", "")
+  -- Decode entities
+  inner = inner:gsub("&amp;",  "&")
+  inner = inner:gsub("&lt;",   "<")
+  inner = inner:gsub("&gt;",   ">")
+  inner = inner:gsub("&quot;", '"')
+  inner = inner:gsub("&#39;",  "'")
+  inner = inner:gsub("&nbsp;", " ")
+  inner = inner:gsub("&#x27;", "'")
+  inner = inner:gsub("&#x2F;", "/")
+  -- Normalise indentation: trim leading/trailing blank lines, keep internal lines
+  local result_lines = {}
+  for line in (inner .. "\n"):gmatch("([^\n]*)\n") do
+    table.insert(result_lines, line)
+  end
+  -- Trim leading/trailing blank lines
+  while #result_lines > 0 and result_lines[1]:match("^%s*$") do
+    table.remove(result_lines, 1)
+  end
+  while #result_lines > 0 and result_lines[#result_lines]:match("^%s*$") do
+    table.remove(result_lines)
+  end
+  return table.concat(result_lines, "\n")
+end
+
 --- Finds the first <div class="docblock"> and extracts it by counting
 --- <div>/<\/div> pairs so we get the full nested content.
 ---@param html string
@@ -378,15 +426,167 @@ local function collect_impl_blocks(html, markers)
 end
 
 -- ---------------------------------------------------------------------------
+-- Crate index section extractor
+-- ---------------------------------------------------------------------------
+
+--- Resolve a relative href against a base URL.
+--- e.g. base = "https://docs.rs/serde_json/1.0/serde_json/"
+---       href = "fn.from_reader.html"
+---       → "https://docs.rs/serde_json/1.0/serde_json/fn.from_reader.html"
+---@param base string
+---@param href string
+---@return string
+local function resolve_url(base, href)
+  if href:match("^https?://") then return href end
+  -- Strip query/fragment from href
+  href = href:gsub("[?#].*", "")
+  -- Separate protocol from the rest so we never mangle the "//"
+  local proto, rest = base:match("^(https?://)(.*)")
+  if not proto then
+    proto = "https://"
+    rest  = base
+  end
+  -- rest = "docs.rs/serde_json/1.0/serde_json/" (no protocol)
+  -- Drop everything after the last "/" to get the directory
+  local dir = rest:match("^(.*/)") or ""
+  -- Split dir into path segments
+  local parts = {}
+  for seg in dir:gmatch("[^/]+") do table.insert(parts, seg) end
+  -- Apply href segments (handle ../ and ./)
+  for seg in href:gmatch("[^/]+") do
+    if seg == ".." then
+      if #parts > 0 then parts[#parts] = nil end
+    elseif seg ~= "." then
+      table.insert(parts, seg)
+    end
+  end
+  return proto .. table.concat(parts, "/")
+end
+
+--- The crate items section IDs rustdoc uses and their human-readable labels.
+--- Order matches rustdoc's page order.
+local CRATE_SECTION_IDS = {
+  { id = "reexports",   label = "Re-exports"   },
+  { id = "modules",     label = "Modules"      },
+  { id = "macros",      label = "Macros"       },
+  { id = "structs",     label = "Structs"      },
+  { id = "enums",       label = "Enums"        },
+  { id = "unions",      label = "Unions"       },
+  { id = "constants",   label = "Constants"    },
+  { id = "statics",     label = "Statics"      },
+  { id = "traits",      label = "Traits"       },
+  { id = "functions",   label = "Functions"    },
+  { id = "types",       label = "Type Aliases" },
+  { id = "attributes",  label = "Attribute Macros" },
+  { id = "derives",     label = "Derive Macros" },
+}
+
+--- Extract the crate-level item sections (Modules, Structs, Functions, etc.)
+--- that rustdoc renders as <dl class="item-table"> blocks after the crate description.
+---
+--- Returns a list of sections, each with a label and a list of items.
+--- Each item has: name, href (absolute), kind, desc, portability (optional note).
+---
+---@param html string
+---@param base_url string   The URL of the page, used to resolve relative hrefs
+---@return { label:string, items:{name:string, href:string, kind:string, desc:string, portability:string}[] }[]
+local function extract_crate_sections(html, base_url)
+  local result = {}
+
+  for _, sec in ipairs(CRATE_SECTION_IDS) do
+    -- Find the <h2 id="<sec.id>" ...> tag
+    local h2_pat = '<h2[^>]+id%s*=%s*"' .. sec.id .. '"[^>]*>'
+    local h2_s, h2_e = html:find(h2_pat)
+    if not h2_s then goto continue_sec end
+
+    -- Find the next <dl class="item-table"> after the h2
+    local dl_s, dl_e = html:find('<dl[^>]+class="[^"]*item%-table[^"]*"[^>]*>', h2_e)
+    if not dl_s then goto continue_sec end
+
+    -- Find its closing </dl>
+    local dl_close = html:find("</dl>", dl_e)
+    if not dl_close then goto continue_sec end
+
+    local dl_inner = html:sub(dl_e + 1, dl_close - 1)
+
+    -- Walk all <dt>…</dt> / <dd>…</dd> pairs
+    local items = {}
+    local pos = 1
+    while true do
+      local dt_s, dt_e = dl_inner:find("<dt[^>]*>", pos)
+      if not dt_s then break end
+      local dt_close = dl_inner:find("</dt>", dt_e)
+      if not dt_close then break end
+
+      local dt_inner = dl_inner:sub(dt_e + 1, dt_close - 1)
+
+      -- Extract href and title from the anchor
+      local href_rel = dt_inner:match('<a[^>]+href%s*=%s*"([^"]*)"')
+      local kind     = dt_inner:match('<a[^>]+class%s*=%s*"([^"]*)"')
+                    or dt_inner:match('title%s*=%s*"([^"]+)%s+[^"]*"') -- fallback
+      -- Normalise kind: "fn", "struct", "enum", "mod", "macro", "trait", "type", etc.
+      if kind then kind = kind:match("^(%S+)") end
+
+      -- Item name: strip <wbr> and other tags, decode entities
+      local name_raw = dt_inner:gsub("<wbr>", ""):gsub('<span[^>]*>.-</span>', "")
+      local name = strip_tags(name_raw):gsub("%s+", ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+      -- Portability note (e.g. "std", "nightly-only")
+      local portability = ""
+      local stab = dt_inner:match('<span[^>]+class="[^"]*stab[^"]*"[^>]*>(.-)</span>')
+      if stab then
+        portability = strip_tags(stab):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+      end
+
+      -- <dd> immediately after </dt>
+      local dd_s, dd_e = dl_inner:find("<dd[^>]*>", dt_close + 1)
+      local desc = ""
+      if dd_s then
+        local dd_close = dl_inner:find("</dd>", dd_e)
+        if dd_close then
+          desc = strip_tags(dl_inner:sub(dd_e + 1, dd_close - 1))
+                  :gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+        end
+        pos = (dd_close or dt_close) + 1
+      else
+        pos = dt_close + 1
+      end
+
+      if href_rel and name ~= "" then
+        local abs_href = resolve_url(base_url, href_rel)
+        table.insert(items, {
+          name        = name,
+          href        = abs_href,
+          kind        = kind or sec.id:gsub("s$", ""),  -- fallback: strip plural
+          desc        = desc,
+          portability = portability,
+        })
+      end
+    end
+
+    if #items > 0 then
+      table.insert(result, { label = sec.label, items = items })
+    end
+
+    ::continue_sec::
+  end
+
+  return result
+end
+
+-- ---------------------------------------------------------------------------
 -- Renderer: assemble lines
 -- ---------------------------------------------------------------------------
 
 --- Render a parsed doc page into a list of lines suitable for a Neovim buffer.
+--- Also returns a link_map: { [1-based line number] = absolute_url } for every
+--- item line that has a navigable doc link (used by the gd keymap).
 ---@param html string
 ---@param url string
----@return string[]
+---@return string[], table<integer,string>
 function M.render(html, url)
-  local lines = {}
+  local lines    = {}
+  local link_map = {}  -- [line_number] = absolute_url
 
   local function push(s)
     for _, line in ipairs(vim.split(s or "", "\n", { plain = true })) do
@@ -394,15 +594,20 @@ function M.render(html, url)
     end
   end
 
-  local function separator()
-    table.insert(lines, string.rep("─", 78))
+  --- Push a line that carries a navigable link.
+  ---@param s string
+  ---@param href string
+  local function push_link(s, href)
+    for _, line in ipairs(vim.split(s or "", "\n", { plain = true })) do
+      local ln = #lines + 1
+      table.insert(lines, line)
+      link_map[ln] = href
+    end
   end
 
   local function section_header(label)
     table.insert(lines, "")
-    separator()
-    table.insert(lines, "  " .. label:upper())
-    separator()
+    table.insert(lines, "# " .. label)
     table.insert(lines, "")
   end
 
@@ -411,13 +616,21 @@ function M.render(html, url)
   if title ~= "" then
     push("# " .. title)
     push("")
-    push(string.rep("═", 78))
-    push("")
   end
 
   -- Source URL (for gx keymap)
   push("URL: " .. url)
   push("")
+
+  -- ── Signature ──────────────────────────────────────────────────────────────
+  local sig = extract_signature(html)
+  if sig ~= "" then
+    section_header("Signature")
+    push("```rust")
+    push(sig)
+    push("```")
+    push("")
+  end
 
   -- ── Description ────────────────────────────────────────────────────────────
   local desc = extract_main_desc(html)
@@ -463,58 +676,66 @@ function M.render(html, url)
     if group and #group > 0 then
       section_header(sec_label)
 
-      -- For trait sections, emit a compact summary list of trait names first
-      if sec_label == "Trait Implementations" or sec_label == "Blanket Implementations" then
-        local names = {}
-        for _, blk in ipairs(group) do
-          if blk.impl_header ~= "" then
-            -- Extract just the trait name: "impl Foo<Bar> for Baz" → "Foo<Bar>"
-            local trait_name = blk.impl_header:match("^impl%s+(.-)%s+for%s+")
-                            or blk.impl_header:match("^impl%s+(.*)")
-            if trait_name then
-              table.insert(names, trait_name)
-            end
-          end
-        end
-        if #names > 0 then
-          push("  " .. table.concat(names, " · "))
-          push("")
-        end
-      end
-
       for _, blk in ipairs(group) do
-        -- Emit impl header (e.g. "impl AsFd for TcpListener")
+        -- Emit impl header as ## subheading (e.g. "impl AsFd for TcpListener")
         if blk.impl_header ~= "" then
-          push("  " .. blk.impl_header)
+          push("")
+          push("## " .. blk.impl_header)
+          push("")
         end
         -- Emit availability / portability note
         if blk.availability ~= "" then
-          push("  (" .. blk.availability .. ")")
+          push("*" .. blk.availability .. "*")
+          push("")
         end
         -- Emit each method
         for _, method in ipairs(blk.methods) do
-          table.insert(lines, "    ```rust")
-          table.insert(lines, "    " .. method.sig)
-          table.insert(lines, "    ```")
+          push("```rust")
+          push(method.sig)
+          push("```")
           if method.doc ~= "" then
-            push("      " .. method.doc)
+            push(method.doc)
           end
-          table.insert(lines, "")
-        end
-        -- Blank line between impl blocks (only if there were methods or a header)
-        if blk.impl_header ~= "" and #blk.methods == 0 then
-          table.insert(lines, "")
+          push("")
         end
       end
     end
   end
 
-  -- ── Footer ─────────────────────────────────────────────────────────────────
-  separator()
-  push("  vim: ft=markdown | rust-docs.nvim")
-  separator()
+  -- ── Crate item sections (Modules, Structs, Functions, …) ───────────────────
+  -- These are present on crate/module index pages. On item pages (fn, struct…)
+  -- this will return an empty list so it's a no-op there.
+  local crate_sections = extract_crate_sections(html, url)
+  for _, csec in ipairs(crate_sections) do
+    section_header(csec.label)
 
-  return lines
+    -- Column widths for alignment
+    local name_w = 0
+    for _, item in ipairs(csec.items) do
+      if #item.name > name_w then name_w = #item.name end
+    end
+    name_w = math.min(name_w, 40)
+
+    for _, item in ipairs(csec.items) do
+      -- Format: "  name_padded   desc [portability]"
+      local name_col = item.name
+      if #name_col < name_w then
+        name_col = name_col .. string.rep(" ", name_w - #name_col)
+      end
+      local portability_suffix = item.portability ~= "" and ("  [" .. item.portability .. "]") or ""
+      local line = "  " .. name_col .. "   " .. item.desc .. portability_suffix
+      push_link(line, item.href)
+    end
+
+    push("")
+  end
+
+  -- ── Footer ─────────────────────────────────────────────────────────────────
+  push("")
+  push("*rust-docs.nvim*")
+  push("")
+
+  return lines, link_map
 end
 
 return M
