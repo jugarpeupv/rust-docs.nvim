@@ -42,12 +42,12 @@ use {
 
 ## Usage
 
-| Command / Keymap        | Action                                                               |
-|-------------------------|----------------------------------------------------------------------|
-| `<leader>rd`            | Open picker — jumps straight to items if a source is remembered      |
-| `:RustDocs`             | Same as `<leader>rd`                                                 |
-| `:RustDocs source`      | Resets session memory and opens the source picker                    |
-| `:RustDocs refresh`     | Rebuild the std index from local rustdoc, then open                  |
+| Command / Keymap    | Action                                                          |
+|---------------------|-----------------------------------------------------------------|
+| `<leader>rd`        | Open picker — jumps straight to items if a source is remembered |
+| `:RustDocs`         | Same as `<leader>rd`                                            |
+| `:RustDocs source`  | Reset session memory and open the source picker                 |
+| `:RustDocs refresh` | Rebuild the std index from local rustdoc, then open             |
 
 ### Session memory
 
@@ -70,28 +70,46 @@ want to switch to a different crate or back to `std`.
 
 ### Inside the item picker
 
-| Key      | Action                                      |
-|----------|---------------------------------------------|
-| `<CR>`   | Open selected item in current window        |
-| `<C-s>`  | Open in horizontal split                    |
-| `<C-v>`  | Open in vertical split                      |
-| `<C-t>`  | Open in new tab                             |
-| `<C-b>`  | Forget remembered source, open source picker|
-| `<C-e>`  | Open the crate's root index page (no item)  |
+Items are ordered by kind (types first, callables last), then alphabetically
+within each kind. Fuzzy scoring takes over as you type.
 
-`<C-e>` is only active when browsing an external crate (not std). It fetches
-`https://docs.rs/<crate>/<version>/<crate>/` and renders it as a buffer — useful
-when you just want a high-level overview without drilling into a specific item.
+| Key     | Action                                       |
+|---------|----------------------------------------------|
+| `<CR>`  | Open selected item in current window         |
+| `<C-s>` | Open in horizontal split                     |
+| `<C-v>` | Open in vertical split                       |
+| `<C-t>` | Open in new tab                              |
+| `<C-b>` | Forget remembered source, open source picker |
+| `<C-e>` | Open the crate's root index page (no item)   |
+
+`<C-e>` is only shown in the picker title and only active when browsing an
+external crate (not std). `<C-b>` is also only active inside the item picker,
+not globally.
+
+When using Telescope, all standard actions work as expected — including sending
+results to the quickfix list (`<C-q>` / `<M-q>`).
 
 ### Inside the doc buffer
 
-| Key   | Action                        |
-|-------|-------------------------------|
-| `]]`  | Jump to next section          |
-| `[[`  | Jump to previous section      |
-| `gx`  | Open current doc in browser   |
-| `R`   | Reload / re-fetch this page   |
-| `q`   | Close the buffer              |
+The buffer is rendered as Markdown. Top-level sections (`# Signature`,
+`# Description`, `# Implementations`, …) use `#` headings. Within the
+description, any sub-headings from the original rustdoc page are preserved as
+`##` / `###`. Impl block headers appear as `##` subheadings.
+
+| Key  | Action                       |
+|------|------------------------------|
+| `]]` | Jump to next heading         |
+| `[[` | Jump to previous heading     |
+| `gx` | Open current doc in browser  |
+| `gd` | Follow link under cursor     |
+| `R`  | Reload / re-fetch this page  |
+| `q`  | Close the buffer             |
+
+`]]` / `[[` navigate across all heading levels (`#`, `##`, `###`).
+
+Folds are enabled automatically (`foldmethod=expr`) using the Treesitter
+markdown fold expression. All folds start open (`foldlevel=99`). Use `za` to
+toggle a section fold.
 
 ## Configuration
 
@@ -118,6 +136,8 @@ require("rust-docs").setup({
     clear_source     = "<C-b>",
     -- Picker-local: open the crate's root index page without picking an item
     open_crate_index = "<C-e>",
+    -- Buffer-local: follow a link under the cursor to its doc page
+    go_to_doc        = "gd",
     -- Buffer-local navigation
     section_next     = "]]",
     section_prev     = "[[",
@@ -143,17 +163,35 @@ from `docs.rs` (gzip-compressed), extracts all public items and their methods,
 and feeds them into the item picker. The raw JSON is cached locally so
 subsequent opens of the same crate version are instant.
 
+### Item ordering
+
+Items in the picker are sorted by kind before fuzzy scoring kicks in:
+
+| Priority | Kinds                                          |
+|----------|------------------------------------------------|
+| 1        | `mod`                                          |
+| 2        | `struct`                                       |
+| 3        | `enum`                                         |
+| 4        | `trait`                                        |
+| 5        | `typedef`                                      |
+| 6        | `primitive`                                    |
+| 7        | `macro`                                        |
+| 8        | `const`                                        |
+| 9        | `static`                                       |
+| 10       | `fn`                                           |
+| 11       | `method`                                       |
+
+Within each kind, items are sorted alphabetically by their fully-qualified path.
+
 ### Doc buffer
 
-Selecting an item fetches its HTML page with `curl`, then:
+Selecting an item fetches its HTML page with `curl` and renders it as Markdown:
 
-- Extracts the item title from `<h1>`.
-- Extracts the full **signature** from `<pre class="rust item-decl">`, including
-  `where` clauses.
-- Extracts the top-level **description** from the first `<div class="docblock">`.
-- Extracts **Implementations**, **Trait Implementations**, **Auto Trait
-  Implementations**, and **Blanket Implementations** from the impl-toggle
-  `<details>` blocks, showing each method's signature and first doc line.
+- **Title** — from `<h1>`, rendered as `# Title`.
+- **Signature** — from `<pre class="rust item-decl">`, rendered under `# Signature` as a fenced `rust` code block.
+- **Description** — from the first `<div class="docblock">`, rendered under `# Description`. Sub-headings from the original rustdoc page (`<h2>`, `<h3>`) are preserved as `##` / `###` headings.
+- **Implementations** — rendered under `# Implementations` (and `# Trait Implementations`, etc.). Each `impl` block is a `##` subheading; method signatures are fenced code blocks.
+- **Crate index sections** (Modules, Structs, Functions, …) — present on crate/module index pages, each as a `# Section` heading with an aligned item list.
 
 The result is written to a named, buflisted buffer
 (`rust-docs://serde_json::Value`). Re-visiting the same item reuses the existing
