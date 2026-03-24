@@ -36,13 +36,19 @@ local function crate_json_cache_path(name, version)
 end
 
 --- Check if a cached items file is still valid (within TTL).
+--- "latest" caches use a shorter TTL (1 day) so they don't go stale for too
+--- long when docs.rs publishes a new version between Neovim sessions.
 ---@param path string
+---@param version string
 ---@return boolean
-local function items_cache_valid(path)
+local function items_cache_valid(path, version)
   local stat = vim.uv.fs_stat(path)
   if not stat then return false end
   local age = os.time() - stat.mtime.sec
-  return age < config.options.index_ttl
+  local ttl = (version == "latest")
+    and math.min(config.options.index_ttl, 60 * 60 * 24)  -- max 1 day for "latest"
+    or  config.options.index_ttl
+  return age < ttl
 end
 
 --- Search crates.io for crates matching a query string.
@@ -147,7 +153,7 @@ function M.get_crate_items(name, version, callback)
   local items_path = crate_cache_path(name, version)
 
   -- Check cache first
-  if items_cache_valid(items_path) then
+  if items_cache_valid(items_path, version) then
     local fd = io.open(items_path, "r")
     if fd then
       local raw = fd:read("*a")
@@ -206,10 +212,11 @@ end
 ---@param out_path string       destination for items.json
 ---@param callback fun(err: string|nil, items: RustDocs.Item[]|nil)
 function _parse_crate_json(crate_name, version, json_gz_path, out_path, callback)
-  -- The base URL for this crate on docs.rs.
-  -- Pattern: https://docs.rs/{name}/{version}/{name}
-  -- "latest" in the URL resolves to the concrete version at render time.
-  local base_url = "https://docs.rs/" .. crate_name .. "/" .. version .. "/" .. crate_name
+  -- The base URL prefix for this crate on docs.rs.
+  -- Pattern: https://docs.rs/{pkg_name}/{version}/{lib_name}
+  -- lib_name may differ from pkg_name (e.g. "xml-rs" pkg uses "xml" lib).
+  -- We pass only the pkg/version prefix here; Python appends the detected lib name.
+  local base_url_prefix = "https://docs.rs/" .. crate_name .. "/" .. version
 
   local script = string.format([[
 import json, gzip, os, re
@@ -225,7 +232,13 @@ else:
 
 index = data.get("index", {})
 paths = data.get("paths", {})
-crate_name = %q
+# The package name passed in (e.g. "xml-rs") may differ from the actual
+# crate root name in the JSON (e.g. "xml"). Detect the real root name from
+# the JSON's "root" field so that path filtering works correctly.
+_pkg_name = %q
+_root_id = str(data.get("root", ""))
+_root_item = index.get(_root_id) or {}
+crate_name = _root_item.get("name") or _pkg_name
 
 KIND_URL_SEG = {
     "struct": "struct", "enum": "enum", "function": "fn", "trait": "trait",
@@ -240,7 +253,7 @@ KIND_LABEL = {
     "assoc_type": "associated type", "assoc_const": "associated const",
     "variant": "variant", "struct_field": "struct field",
 }
-BASE_URL = %q
+BASE_URL = %q + "/" + crate_name
 
 SKIP_KINDS = {"impl", "use", "struct_field", "variant", "assoc_type", "assoc_const"}
 METHOD_PARENT_KINDS = {"struct", "enum", "trait", "primitive", "type_alias"}
@@ -353,14 +366,22 @@ for item_id, item in index.items():
     pub_path = public_paths.get(item_id)
     orig_info = paths.get(item_id)
 
+    # Determine the display path (shortest public re-export wins for UX).
     if pub_path and pub_path[:1] == [crate_name]:
-        path_parts = pub_path
+        display_parts = pub_path
     elif orig_info and orig_info["path"][:1] == [crate_name]:
-        path_parts = orig_info["path"]
+        display_parts = orig_info["path"]
     else:
         continue
 
-    full_path = "::".join(path_parts)
+    # Always use the canonical path from `paths[]` for URL generation —
+    # docs.rs serves pages at the original module location, not re-export paths.
+    if orig_info and orig_info["path"][:1] == [crate_name]:
+        url_parts = orig_info["path"]
+    else:
+        url_parts = display_parts
+
+    full_path = "::".join(display_parts)
     if full_path in seen_full_paths:
         continue
     seen_full_paths.add(full_path)
@@ -369,10 +390,10 @@ for item_id, item in index.items():
     docs = (item.get("docs") or "").strip()
     first_line = docs.split("\n")[0][:120] if docs else ""
     kind_label = KIND_LABEL.get(kind_key, kind_key)
-    parent_path = "::".join(path_parts[:-1]) if len(path_parts) > 1 else crate_name
+    parent_path = "::".join(display_parts[:-1]) if len(display_parts) > 1 else crate_name
 
-    name_part = path_parts[-1]
-    mid = path_parts[1:-1]
+    name_part = url_parts[-1]
+    mid = url_parts[1:-1]
     mid_seg = "/".join(mid) + "/" if mid else ""
     type_seg = KIND_URL_SEG.get(kind_key)
     if type_seg == "index":
@@ -526,7 +547,7 @@ with open(%q, "w") as f:
     json.dump(items, f, separators=(",", ":"))
 
 print(len(items))
-]], json_gz_path, crate_name, base_url, out_path)
+]], json_gz_path, crate_name, base_url_prefix, out_path)
 
   -- Write script to temp file
   local script_path = config.options.cache_dir .. "/parse_crate_" .. crate_name .. ".py"
@@ -557,6 +578,12 @@ print(len(items))
           vim.log.levels.INFO
         )
 
+        -- Clean up ephemeral files: the raw .json.gz is no longer needed once
+        -- the items cache exists, and the parse script is always regenerated on
+        -- the next cache miss — no reason to keep either on disk.
+        vim.uv.fs_unlink(json_gz_path, function() end)
+        vim.uv.fs_unlink(script_path, function() end)
+
         -- Load from cache
         local f = io.open(out_path, "r")
         if not f then
@@ -575,6 +602,20 @@ print(len(items))
       end)
     end
   )
+end
+
+--- Force-invalidate the cached items for a specific crate+version, then
+--- re-download and re-parse. Calls callback(err, items) on completion.
+---@param name string
+---@param version string
+---@param callback fun(err: string|nil, items: RustDocs.Item[]|nil)
+function M.refresh_crate(name, version, callback)
+  local items_path = crate_cache_path(name, version)
+  local gz_path    = crate_json_cache_path(name, version)
+  -- Delete both cached files (ignore errors if they don't exist)
+  vim.uv.fs_unlink(items_path, function() end)
+  vim.uv.fs_unlink(gz_path,    function() end)
+  M.get_crate_items(name, version, callback)
 end
 
 return M

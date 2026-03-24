@@ -15,6 +15,7 @@ function M.fetch(url, callback)
       "--fail",
       "--location",
       "--compressed",
+      "--http1.1",   -- avoid HTTP/2 stream resets on docs.rs 404s (exit 56)
       "--user-agent", "rust-docs.nvim/1.0 (Neovim plugin)",
       url,
     },

@@ -282,6 +282,25 @@ function M.refresh()
   end)
 end
 
+--- Force re-download and re-parse of the currently active crate's index.
+--- If the last source was std (or no source is set), falls back to M.refresh().
+function M.refresh_crate()
+  local src = M._last_source
+  if not src or src.kind ~= "crate" then
+    vim.notify("rust-docs: no crate source active — refreshing std index instead", vim.log.levels.INFO)
+    M.refresh()
+    return
+  end
+  local crates = require("rust-docs.search.crates")
+  crates.refresh_crate(src.crate.name, src.version, function(err)
+    if err then
+      vim.notify(err, vim.log.levels.ERROR)
+      return
+    end
+    M.open()
+  end)
+end
+
 -- ---------------------------------------------------------------------------
 -- Setup
 -- ---------------------------------------------------------------------------
@@ -306,6 +325,8 @@ function M.setup(opts)
     local sub = args.args:match("^(%S+)")
     if sub == "refresh" then
       M.refresh()
+    elseif sub == "refresh-crate" then
+      M.refresh_crate()
     elseif sub == "source" then
       M.clear_source()
       M.open_source_picker()
@@ -315,9 +336,9 @@ function M.setup(opts)
   end, {
     nargs = "?",
     complete = function()
-      return { "refresh", "source" }
+      return { "refresh", "refresh-crate", "source" }
     end,
-    desc = "Open Rust docs picker (:RustDocs source to reset, :RustDocs refresh to rebuild std index)",
+    desc = "Open Rust docs picker (:RustDocs source | refresh | refresh-crate)",
   })
 end
 
