@@ -7,6 +7,8 @@
 ---@field kind      string   Item kind (e.g. "struct", "fn", "trait", …)
 ---@field desc      string   Short description from the search index
 ---@field url       string   URL to the HTML documentation page
+---@field params?   string   Space-separated parameter types for fn/method items (e.g. "BufReader<R> usize")
+---@field ret?      string   Return type string for fn/method items (e.g. "Result<usize>")
 
 ---@class RustDocs.MethodEntry
 ---@field section string  Section label (e.g. "Implementations", "Trait Implementations")

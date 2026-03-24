@@ -292,6 +292,13 @@ function M.open(items, title, index_url)
     end,
   }
 
+  -- Wire key bindings (define key_defs before any conditional mutations)
+  local key_defs = {
+    ["<C-s>"] = { "open_split",  mode = { "i", "n" } },
+    ["<C-v>"] = { "open_vsplit", mode = { "i", "n" } },
+    ["<C-t>"] = { "open_tab",    mode = { "i", "n" } },
+  }
+
   -- Forget remembered source and re-open the source picker
   if clear_src_key and clear_src_key ~= "" then
     actions.clear_source = function(picker, _entry)
@@ -302,13 +309,6 @@ function M.open(items, title, index_url)
     end
     key_defs[clear_src_key] = { "clear_source", mode = { "i", "n" } }
   end
-
-  -- Wire the crate-index action only when a URL is provided
-  local key_defs = {
-    ["<C-s>"] = { "open_split",  mode = { "i", "n" } },
-    ["<C-v>"] = { "open_vsplit", mode = { "i", "n" } },
-    ["<C-t>"] = { "open_tab",    mode = { "i", "n" } },
-  }
 
   if index_url then
     actions.open_crate_index = function(picker, _entry)
@@ -328,15 +328,35 @@ function M.open(items, title, index_url)
       local entries = {}
       for _, item in ipairs(items) do
         table.insert(entries, {
-          text  = item.full_path .. " " .. (item.kind or "") .. " " .. (item.desc or ""),
-          label = item.full_path,
-          kind  = item.kind or "?",
-          desc  = item.desc or "",
-          _item = item,
+          -- `text` is what Snacks fuzzy-matches against; include all searchable fields.
+          -- Prefix magic (p: / r:) is handled in the `filter` callback below.
+          text   = item.full_path .. " " .. (item.kind or "") .. " " .. (item.desc or "")
+                   .. " " .. (item.params or "") .. " " .. (item.ret or ""),
+          label  = item.full_path,
+          kind   = item.kind or "?",
+          desc   = item.desc or "",
+          params = item.params or "",
+          ret    = item.ret or "",
+          _item  = item,
         })
       end
       return entries
     end)(),
+
+    -- Custom filter: intercept p: / r: prefixes for targeted field search.
+    -- When no prefix is present, Snacks performs its normal fuzzy match on `text`.
+    filter = function(item, query)
+      if not query or query == "" then return true end
+      local q = query:lower()
+      local prefix, rest = q:match("^([pr]):(.*)")
+      if not prefix then return nil end  -- nil = delegate to default Snacks scoring
+      if rest == "" then return true end
+      if prefix == "p" then
+        return (item.params or ""):lower():find(rest, 1, true) ~= nil
+      else
+        return (item.ret or ""):lower():find(rest, 1, true) ~= nil
+      end
+    end,
 
     format = function(entry, _ctx)
       local parts = {}

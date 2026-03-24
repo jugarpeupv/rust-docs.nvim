@@ -213,6 +213,66 @@ SKIP_KINDS = {"impl", "use", "struct_field", "variant", "assoc_type", "assoc_con
 # Kinds whose HTML pages may contain #method.* anchors worth indexing
 METHOD_PARENT_KINDS = {"struct", "enum", "trait", "primitive", "type_alias"}
 
+# ---- Type-to-string helper (for params/ret extraction) ----
+def type_to_str(t, depth=0):
+    """Recursively convert a rustdoc JSON type object to a short readable string."""
+    if depth > 6 or t is None:
+        return ""
+    if isinstance(t, str):
+        return t
+    if not isinstance(t, dict):
+        return ""
+    if "primitive" in t:
+        return t["primitive"]
+    if "generic" in t:
+        return t["generic"]
+    if "resolved_path" in t:
+        rp = t["resolved_path"]
+        name = (rp.get("path") or "").split("::")[-1]
+        args = rp.get("args") or {}
+        ab = args.get("angle_bracketed", {})
+        type_args = [type_to_str(a["type"], depth+1) for a in ab.get("args", []) if "type" in a]
+        type_args = [s for s in type_args if s]
+        return (name + "<" + ", ".join(type_args) + ">") if type_args else name
+    if "borrowed_ref" in t:
+        br = t["borrowed_ref"]
+        inner = type_to_str(br.get("type"), depth+1)
+        return "&" + ("mut " if br.get("is_mutable") else "") + inner
+    if "raw_pointer" in t:
+        rp = t["raw_pointer"]
+        return "*" + ("mut " if rp.get("is_mutable") else "const ") + type_to_str(rp.get("type"), depth+1)
+    if "slice" in t:
+        return "[" + type_to_str(t["slice"], depth+1) + "]"
+    if "array" in t:
+        return "[" + type_to_str(t["array"].get("type"), depth+1) + "]"
+    if "tuple" in t:
+        return "(" + ", ".join(type_to_str(x, depth+1) for x in t["tuple"]) + ")"
+    if "impl_trait" in t:
+        names = [b["trait_bound"]["trait"].get("path","").split("::")[-1]
+                 for b in t["impl_trait"] if "trait_bound" in b]
+        return "impl " + " + ".join(names)
+    if "dyn_trait" in t:
+        names = [tb.get("trait",{}).get("path","").split("::")[-1]
+                 for tb in t["dyn_trait"].get("traits", [])]
+        return "dyn " + " + ".join(names)
+    return ""
+
+def sig_to_params_ret(inner, kind_key):
+    """Extract (params_str, ret_str) from a function/method inner dict."""
+    fn_inner = inner.get(kind_key) or {}
+    sig = fn_inner.get("sig") or {}
+    inputs = sig.get("inputs") or []
+    params = []
+    for pname, ptype in inputs:
+        if pname == "self":
+            continue
+        s = type_to_str(ptype)
+        if s:
+            params.append(s)
+    output = sig.get("output")
+    ret = type_to_str(output) if output else ""
+    return " ".join(params), ret
+
 # ---- Build public re-export paths from 'use' items ----
 # The paths[] dict uses internal module paths; re-exports give us the public path.
 # We walk module.items to find parent modules, then follow use items to their targets.
@@ -309,6 +369,8 @@ for item_id, item in index.items():
         "kind":      kind_label,
         "desc":      first_line,
         "url":       url,
+        "params":    sig_to_params_ret(inner, kind_key)[0] if kind_key in ("function", "method") else "",
+        "ret":       sig_to_params_ret(inner, kind_key)[1] if kind_key in ("function", "method") else "",
     })
 
     if kind_key in METHOD_PARENT_KINDS and type_seg and type_seg != "index":
@@ -354,6 +416,8 @@ for parent_full_path, parent_url in method_parents:
             "full_path": full_path,
             "kind":      "method",
             "desc":      "",
+            "params":    "",
+            "ret":       "",
             "url":       parent_url + "#method." + base_name,
         })
 
