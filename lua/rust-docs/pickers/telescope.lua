@@ -273,9 +273,7 @@ function M.open_crate_search(on_select)
   local debounce_timer = nil
   local inflight       = nil
   local request_seq    = 0
-
-  -- The picker is created with an empty finder; we swap finders when results arrive.
-  local picker_ref = nil
+  local last_searched  = nil   -- guard: skip network call when query unchanged
 
   local function do_search(query)
     -- Kill stale request.
@@ -284,7 +282,15 @@ function M.open_crate_search(on_select)
       inflight = nil
     end
 
-    if not query or query == "" then return end
+    if not query or query == "" then
+      last_searched = nil
+      return
+    end
+
+    -- Skip if we already fetched results for this exact query (e.g. j/k navigation
+    -- fires on_input_filter_cb with the same prompt text, which would reset the cursor).
+    if query == last_searched then return end
+    last_searched = query
 
     request_seq = request_seq + 1
     local my_seq = request_seq
