@@ -604,6 +604,74 @@ print(len(items))
   )
 end
 
+--- Search items for an external crate by fuzzy-filtering the cached item list.
+--- Downloads+parses the rustdoc JSON on first call (same as get_crate_items),
+--- then does a simple case-insensitive substring filter over name/full_path/desc.
+--- Results are limited to 50 to match the std search engine limit.
+---
+---@param name string
+---@param version string
+---@param query string
+---@param callback fun(err: string|nil, items: RustDocs.Item[]|nil)
+function M.search_items(name, version, query, callback)
+  M.get_crate_items(name, version, function(err, items)
+    if err then
+      callback(err, nil)
+      return
+    end
+    if not items then
+      callback(nil, {})
+      return
+    end
+
+    -- Empty query: return up to 50 items in order (kind-sorted already from cache)
+    if not query or query == "" then
+      local subset = {}
+      for i = 1, math.min(50, #items) do
+        subset[i] = items[i]
+      end
+      callback(nil, subset)
+      return
+    end
+
+    local q = query:lower()
+    local matched = {}
+
+    -- Score: 0 = name starts-with, 1 = name contains, 2 = path contains, 3 = desc contains
+    for _, item in ipairs(items) do
+      local name_lc = (item.name or ""):lower()
+      local path_lc = (item.full_path or ""):lower()
+      local desc_lc = (item.desc or ""):lower()
+      local score
+      if name_lc == q then
+        score = 0
+      elseif name_lc:sub(1, #q) == q then
+        score = 1
+      elseif name_lc:find(q, 1, true) then
+        score = 2
+      elseif path_lc:find(q, 1, true) then
+        score = 3
+      elseif desc_lc:find(q, 1, true) then
+        score = 4
+      end
+      if score then
+        table.insert(matched, { score = score, item = item })
+      end
+    end
+
+    table.sort(matched, function(a, b)
+      if a.score ~= b.score then return a.score < b.score end
+      return (a.item.full_path or "") < (b.item.full_path or "")
+    end)
+
+    local result = {}
+    for i = 1, math.min(50, #matched) do
+      result[i] = matched[i].item
+    end
+    callback(nil, result)
+  end)
+end
+
 --- Force-invalidate the cached items for a specific crate+version, then
 --- re-download and re-parse. Calls callback(err, items) on completion.
 ---@param name string

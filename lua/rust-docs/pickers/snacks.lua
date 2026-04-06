@@ -248,18 +248,27 @@ function M.open_crate_search(on_select)
   })
 end
 
---- Open the Snacks picker with the given list of items.
----@param items RustDocs.Item[]
----@param title string          Picker title (e.g. "Rust Docs — serde_json 1.0.149")
+--- Open the Snacks picker with live search powered by the rustdoc search engine.
+--- Uses the `source(filter, cb)` pattern: called on every filter change,
+--- calls index.search() (debounced) and streams results via cb().
+---@param source { kind: "std" } | { kind: "crate", crate: RustDocs.Crate, version: string }
+---@param title string          Picker title
 ---@param index_url string|nil  If set, open_crate_index keymap opens this URL
-function M.open(items, title, index_url)
+function M.open(source, title, index_url)
   local snacks = require_snacks()
   if not snacks then return end
 
+  local index          = require("rust-docs.search.index")
   local buffer         = require("rust-docs.render.buffer")
   local cfg            = require("rust-docs.config").options
   local open_index_key = cfg.keymaps.open_crate_index or "<C-e>"
   local clear_src_key  = cfg.keymaps.clear_source
+  local DEBOUNCE_MS    = 200
+
+  -- Debounce state (shared across `source` invocations for this picker).
+  local debounce_timer = nil
+  local request_seq    = 0
+  local last_query     = nil   -- guard: skip re-search on cursor-only movement
 
   -- Build actions table
   local actions = {
@@ -292,7 +301,7 @@ function M.open(items, title, index_url)
     end,
   }
 
-  -- Wire key bindings (define key_defs before any conditional mutations)
+  -- Wire key bindings
   local key_defs = {
     ["<C-s>"] = { "open_split",  mode = { "i", "n" } },
     ["<C-v>"] = { "open_vsplit", mode = { "i", "n" } },
@@ -323,48 +332,75 @@ function M.open(items, title, index_url)
   end
 
   snacks.picker({
-    title  = index_url and (title or "Rust Docs") .. "  [" .. open_index_key .. "] Open index page" or (title or "Rust Docs"),
-    items  = (function()
-      local entries = {}
-      for _, item in ipairs(items) do
-        table.insert(entries, {
-          -- `text` is what Snacks fuzzy-matches against; include all searchable fields.
-          -- Prefix magic (p: / r:) is handled in the `filter` callback below.
-          text   = item.full_path .. " " .. (item.kind or "") .. " " .. (item.desc or "")
-                   .. " " .. (item.params or "") .. " " .. (item.ret or ""),
-          label  = item.full_path,
-          kind   = item.kind or "?",
-          desc   = item.desc or "",
-          params = item.params or "",
-          ret    = item.ret or "",
-          _item  = item,
-        })
-      end
-      return entries
-    end)(),
+    title  = index_url
+      and (title or "Rust Docs") .. "  [" .. open_index_key .. "] Open index page"
+      or  (title or "Rust Docs"),
 
-    -- Custom filter: intercept p: / r: prefixes for targeted field search.
-    -- When no prefix is present, Snacks performs its normal fuzzy match on `text`.
-    filter = function(item, query)
-      if not query or query == "" then return true end
-      local q = query:lower()
-      local prefix, rest = q:match("^([pr]):(.*)")
-      if not prefix then return nil end  -- nil = delegate to default Snacks scoring
-      if rest == "" then return true end
-      if prefix == "p" then
-        return (item.params or ""):lower():find(rest, 1, true) ~= nil
-      else
-        return (item.ret or ""):lower():find(rest, 1, true) ~= nil
+    -- `source(filter, cb)` is called by Snacks on every filter change.
+    -- We debounce here and delegate to index.search().
+    source = function(filter, cb)
+      local query = (filter and filter.search) or ""
+
+      -- Skip re-search when only cursor moved (query unchanged).
+      if query == last_query then return end
+
+      -- Cancel any pending debounce.
+      if debounce_timer then
+        debounce_timer:stop()
+        debounce_timer:close()
+        debounce_timer = nil
       end
+
+      last_query = query
+
+      if query == "" then
+        cb()  -- signal empty results
+        return
+      end
+
+      -- Bump sequence so stale callbacks discard their results.
+      request_seq = request_seq + 1
+      local my_seq = request_seq
+
+      debounce_timer = vim.uv.new_timer()
+      debounce_timer:start(DEBOUNCE_MS, 0, vim.schedule_wrap(function()
+        if debounce_timer then
+          debounce_timer:close()
+          debounce_timer = nil
+        end
+        if my_seq ~= request_seq then
+          cb()
+          return
+        end
+
+        index.search(query, source, function(err, items)
+          if my_seq ~= request_seq then return end
+          if err then
+            vim.notify("rust-docs: " .. err, vim.log.levels.WARN)
+            cb()
+            return
+          end
+          for _, item in ipairs(items or {}) do
+            cb({
+              text   = item.full_path .. " " .. (item.kind or "") .. " " .. (item.desc or ""),
+              label  = item.full_path,
+              kind   = item.kind or "?",
+              desc   = item.desc or "",
+              _item  = item,
+            })
+          end
+          cb()  -- signal completion
+        end)
+      end))
     end,
 
     format = function(entry, _ctx)
       local parts = {}
-      local kind_str = string.format("%-18s", "[" .. entry.kind .. "]")
+      local kind_str = string.format("%-18s", "[" .. (entry.kind or "?") .. "]")
       local kind_hl = KIND_HL[entry.kind] or "SnacksPickerLabel"
       table.insert(parts, { kind_str, hl = kind_hl })
       table.insert(parts, { "  " })
-      local path_str = string.format("%-50s", entry.label)
+      local path_str = string.format("%-50s", entry.label or "")
       table.insert(parts, { path_str, hl = "Identifier" })
       table.insert(parts, { "  " })
       local desc = entry.desc or ""

@@ -18,125 +18,6 @@ local KIND_HL = {
   ["keyword"]   = "Keyword",
 }
 
---- Levenshtein edit distance (same algorithm used by the rustdoc website).
---- Returns the edit distance between strings a and b, capped at limit+1.
----@param a string
----@param b string
----@param limit integer  max distance to consider; returns limit+1 if exceeded
----@return integer
-local function edit_distance(a, b, limit)
-  -- Make a the longer string (website does the same swap)
-  if #a < #b then a, b = b, a end
-  local min_dist = #a - #b
-  if min_dist > limit then return limit + 1 end
-  -- Strip common prefix / suffix
-  while #b > 0 and b:sub(1,1) == a:sub(1,1) do
-    a = a:sub(2); b = b:sub(2)
-  end
-  while #b > 0 and b:sub(-1) == a:sub(-1) do
-    a = a:sub(1,-2); b = b:sub(1,-2)
-  end
-  if #b == 0 then return min_dist end
-  -- Standard DP
-  local prev = {}
-  local curr = {}
-  for i = 0, #b do prev[i] = i end
-  for i = 1, #a do
-    curr[0] = i
-    for j = 1, #b do
-      if a:sub(i,i) == b:sub(j,j) then
-        curr[j] = prev[j-1]
-      else
-        curr[j] = 1 + math.min(prev[j], curr[j-1], prev[j-1])
-      end
-    end
-    prev, curr = curr, prev
-  end
-  return prev[#b]
-end
-
---- Build a custom sorter for the items picker.
----
---- Replicates the ranking used by doc.rust-lang.org (from search-*.js):
----
----   Normal mode — sort keys in priority order (lower score = better):
----     1. index_bucket: 0 if query found as substring of name, 1 if only edit-dist match
----     2. dist:         edit_distance(name, query)
----     3. pos_score:    position of query in name (0 = starts-with, best)
----     4. name length   (shorter = better)
----   Excluded (-1) when dist > MAX_EDIT_DIST and query not a substring of name
----
---- Prefix modes (filter a single field):
----   "p:<query>"  → include only items where params contains <query>
----   "r:<query>"  → include only items where ret    contains <query>
----
---- Empty prompt: all entries pass with score 0 (preserves insertion order).
----@return table  Telescope Sorter
-local function make_sorter()
-  local MAX_EDIT_DIST = 3  -- matches website threshold
-
-  return require("telescope.sorters").Sorter:new({
-    scoring_function = function(_, prompt, _line, entry)
-      if not prompt or prompt == "" then
-        return 0
-      end
-
-      local item = entry and entry.value
-      if not item then return -1 end
-
-      local q = prompt:lower()
-
-      -- ── Prefix mode: p: params, r: return type ──────────────────────────
-      local prefix, rest = q:match("^([pr]):(.*)")
-      if prefix then
-        if rest == "" then return 0 end
-        local field = (prefix == "p") and (item.params or "") or (item.ret or "")
-        return field:lower():find(rest, 1, true) and 0 or -1
-      end
-
-      -- ── Normal mode: replicate rustdoc website ranking ───────────────────
-      local name = (item.name or ""):lower()
-
-      -- index: 0-based position of query inside name (-1 if not found)
-      local idx = name:find(q, 1, true)
-      local index = idx and (idx - 1) or -1
-
-      -- dist: edit distance between name and query
-      local dist = edit_distance(name, q, MAX_EDIT_DIST)
-
-      -- Exclude when query is not a substring AND edit distance is too large
-      if index < 0 and dist > MAX_EDIT_DIST then
-        return -1
-      end
-
-      -- Pack into a single comparable score (lower = better).
-      local index_bucket = (index >= 0) and 0 or 1
-      local pos_score    = (index >= 0) and index or 0
-
-      return index_bucket * 1000000
-           + dist         * 10000
-           + pos_score    * 100
-           + #name
-    end,
-
-    highlighter = function(_, prompt, display)
-      if not prompt or prompt == "" then return {} end
-      local prefix, rest = prompt:lower():match("^([pr]):(.*)")
-      local q = (prefix and rest ~= "") and rest or prompt:lower()
-      if q == "" then return {} end
-      local pos = display:lower():find(q, 1, true)
-      if pos then
-        local result = {}
-        for i = pos, pos + #q - 1 do
-          table.insert(result, i)
-        end
-        return result
-      end
-      return {}
-    end,
-  })
-end
-
 --- Shared helper: require telescope modules or notify and return nil.
 local function require_telescope()
   local ok, _ = pcall(require, "telescope")
@@ -384,18 +265,22 @@ function M.open_crate_search(on_select)
   picker_ref:find()
 end
 
---- Open the items picker with the given list of items.
----@param items RustDocs.Item[]
----@param title string          Picker title (e.g. "Rust Docs — serde_json 1.0.149")
+--- Open the items picker with live search powered by the rustdoc search engine.
+--- Calls index.search() on each keystroke (debounced ~200 ms).
+--- Results are already ranked by rustdoc; no custom sorter is applied.
+---@param source { kind: "std" } | { kind: "crate", crate: RustDocs.Crate, version: string }
+---@param title string          Picker title
 ---@param index_url string|nil  If set, <C-e> opens this URL as the crate index page
-function M.open(items, title, index_url)
+function M.open(source, title, index_url)
   local t = require_telescope()
   if not t then return end
 
+  local index          = require("rust-docs.search.index")
   local buffer         = require("rust-docs.render.buffer")
   local cfg            = require("rust-docs.config").options
   local open_index_key = cfg.keymaps.open_crate_index or "<C-e>"
   local clear_src_key  = cfg.keymaps.clear_source
+  local DEBOUNCE_MS    = 200
 
   -- Build display with aligned columns: [kind]  path::Name  — description
   local displayer = t.displayer.create({
@@ -417,26 +302,93 @@ function M.open(items, title, index_url)
     })
   end
 
-  t.pickers.new({}, {
-    prompt_title   = index_url and (title or "Rust Docs") .. "  [" .. open_index_key .. "] Open index page" or (title or "Rust Docs"),
-    results_title  = "Items",
-    finder = t.finders.new_table({
-      results = items,
+  local function items_to_finder(items)
+    return t.finders.new_table({
+      results = items or {},
       entry_maker = function(item)
         return {
           value    = item,
           display  = make_display,
-          ordinal  = item.full_path .. " " .. (item.kind or "") .. " " .. (item.desc or "")
-                     .. " " .. (item.params or "") .. " " .. (item.ret or ""),
-          -- Fields used by telescope's quickfix/loclist helpers
+          -- ordinal is used only for the sorter; with empty() sorter it's irrelevant,
+          -- but set it so Telescope doesn't error on nil ordinal.
+          ordinal  = item.full_path,
           filename = item.url,
           text     = "[" .. (item.kind or "?") .. "] " .. item.full_path
                      .. (item.desc ~= "" and ("  " .. item.desc) or ""),
         }
       end,
-    }),
-    sorter = make_sorter(),
+    })
+  end
+
+  -- Debounce state (closed over by on_input_filter_cb)
+  local debounce_timer = nil
+  local request_seq    = 0
+  local last_query     = nil   -- guard: skip refresh when only cursor moved
+  local picker_ref     = nil   -- set after pickers.new():find()
+
+  local function do_search(query)
+    request_seq = request_seq + 1
+    local my_seq = request_seq
+
+    index.search(query, source, function(err, items)
+      if my_seq ~= request_seq then return end
+      if err then
+        vim.notify("rust-docs: " .. err, vim.log.levels.WARN)
+        items = {}
+      end
+      if picker_ref then
+        picker_ref:refresh(items_to_finder(items), { reset_prompt = false })
+      end
+    end)
+  end
+
+  picker_ref = t.pickers.new({}, {
+    prompt_title   = index_url
+      and (title or "Rust Docs") .. "  [" .. open_index_key .. "] Open index page"
+      or  (title or "Rust Docs"),
+    results_title  = "Items  (type to search)",
+    -- Start empty; results arrive async after first search fires.
+    finder    = items_to_finder({}),
+    -- Pass-through sorter: results are already ranked by the rustdoc engine.
+    sorter    = t.sorters.empty(),
     previewer = false,
+
+    -- Fire a debounced search on every keystroke, but NOT on cursor movement.
+    -- on_input_filter_cb fires for every keypress (including <C-j>/<C-k>);
+    -- the last_query guard prevents picker:refresh() on navigation keys.
+    on_input_filter_cb = function(query)
+      -- Navigation keys (<C-j>/<C-k>/arrows) fire this with the same prompt text.
+      -- Bail immediately — do not touch the debounce or results list.
+      if query == last_query then
+        return { prompt = query }
+      end
+      last_query = query
+
+      if debounce_timer then
+        debounce_timer:stop()
+        debounce_timer:close()
+        debounce_timer = nil
+      end
+
+      if not query or query == "" then
+        -- Clear results on empty prompt
+        if picker_ref then
+          picker_ref:refresh(items_to_finder({}), { reset_prompt = false })
+        end
+        return { prompt = query }
+      end
+
+      debounce_timer = vim.uv.new_timer()
+      debounce_timer:start(DEBOUNCE_MS, 0, vim.schedule_wrap(function()
+        if debounce_timer then
+          debounce_timer:close()
+          debounce_timer = nil
+        end
+        do_search(query)
+      end))
+      return { prompt = query }
+    end,
+
     attach_mappings = function(prompt_buf, map)
       -- Default action: open doc buffer
       t.actions.select_default:replace(function()
@@ -494,7 +446,8 @@ function M.open(items, title, index_url)
       end
 
       -- Open the crate index page (no item selected)
-      if index_url then        local function open_index()
+      if index_url then
+        local function open_index()
           t.actions.close(prompt_buf)
           local src = require("rust-docs")._last_source
           local display_name = (src and src.kind == "crate")
@@ -508,7 +461,9 @@ function M.open(items, title, index_url)
 
       return true
     end,
-  }):find()
+  })
+
+  picker_ref:find()
 end
 
 return M

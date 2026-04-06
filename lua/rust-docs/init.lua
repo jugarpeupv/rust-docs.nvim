@@ -46,42 +46,18 @@ local function source_label()
   return src.crate.name .. " " .. src.version
 end
 
---- Kind priority for item ordering: lower = appears first.
---- Types (struct, enum, trait, …) come before callables (fn, method, …).
-local KIND_PRIORITY = {
-  mod       = 1,
-  struct    = 2,
-  enum      = 3,
-  trait     = 4,
-  typedef   = 5,
-  primitive = 6,
-  macro     = 7,
-  const     = 8,
-  static    = 9,
-  fn        = 10,
-  method    = 11,
-}
-
---- Dispatch items to the fuzzy item picker.
+--- Dispatch a live search picker for the given source.
+--- Pickers own the search loop — they call index.search() on each keystroke.
 --- `index_url` is the crate's root HTML page (nil for std).
----@param items RustDocs.Item[]
+---@param source { kind: "std" } | { kind: "crate", crate: RustDocs.Crate, version: string }
 ---@param index_url string|nil
-local function open_items_picker(items, index_url)
-  -- Sort: by kind priority first, then alphabetically by full_path
-  local sorted = vim.deepcopy(items)
-  table.sort(sorted, function(a, b)
-    local pa = KIND_PRIORITY[a.kind] or 99
-    local pb = KIND_PRIORITY[b.kind] or 99
-    if pa ~= pb then return pa < pb end
-    return a.full_path < b.full_path
-  end)
-
+local function open_live_picker(source, index_url)
   local backend = detect_picker()
   local title   = "Rust Docs — " .. source_label()
   if backend == "telescope" then
-    require("rust-docs.pickers.telescope").open(sorted, title, index_url)
+    require("rust-docs.pickers.telescope").open(source, title, index_url)
   elseif backend == "snacks" then
-    require("rust-docs.pickers.snacks").open(sorted, title, index_url)
+    require("rust-docs.pickers.snacks").open(source, title, index_url)
   else
     vim.notify(
       "rust-docs: no picker found. Install telescope.nvim or snacks.nvim",
@@ -100,21 +76,14 @@ end
 ---@param crate RustDocs.Crate
 ---@param forced_version string|nil  Pass a version to skip the picker
 function M.open_crate(crate, forced_version)
-  local cfg       = require("rust-docs.config").options
-  local crate_mod = require("rust-docs.search.crates")
+  local cfg = require("rust-docs.config").options
 
   local function load_version(version)
     -- Remember this choice for the rest of the session
     M._last_source = { kind = "crate", crate = crate, version = version }
 
-    crate_mod.get_crate_items(crate.name, version, function(err, items)
-      if err then
-        vim.notify(err, vim.log.levels.ERROR)
-        return
-      end
-      local index_url = "https://docs.rs/" .. crate.name .. "/" .. version .. "/" .. crate.name .. "/"
-      open_items_picker(items, index_url)
-    end)
+    local index_url = "https://docs.rs/" .. crate.name .. "/" .. version .. "/" .. crate.name .. "/"
+    open_live_picker(M._last_source, index_url)
   end
 
   -- If a version was already decided (session memory or caller), skip the picker
@@ -129,6 +98,7 @@ function M.open_crate(crate, forced_version)
   end
 
   -- Fetch available versions, then show version picker
+  local crate_mod = require("rust-docs.search.crates")
   crate_mod.get_versions(crate.name, function(err, versions)
     if err or not versions or #versions == 0 then
       vim.notify(
@@ -213,14 +183,7 @@ function M.open()
   end
 
   if src.kind == "std" then
-    local index = require("rust-docs.search.index")
-    index.get_items(function(err, items)
-      if err then
-        vim.notify(err, vim.log.levels.ERROR)
-        return
-      end
-      open_items_picker(items, nil)
-    end)
+    open_live_picker(src, nil)
     return
   end
 
@@ -239,15 +202,7 @@ function M._handle_source(source)
   if source.kind == "std" then
     -- Remember std as the session source
     M._last_source = { kind = "std" }
-
-    local index = require("rust-docs.search.index")
-    index.get_items(function(err, items)
-      if err then
-        vim.notify(err, vim.log.levels.ERROR)
-        return
-      end
-      open_items_picker(items, nil)
-    end)
+    open_live_picker(M._last_source, nil)
 
   elseif source.kind == "crate" then
     M.open_crate(source.crate, nil)
