@@ -7,14 +7,18 @@ local M = {}
 ---@field open_mode string          "current" | "split" | "vsplit" | "tab"
 ---@field keymaps RustDocs.Keymaps
 ---@field index_ttl number          Seconds before cached index is considered stale (default 1 week)
----@field prompt_version boolean    Ask for a crate version before browsing (default true). When false, "latest" is used.
+---@field prompt_version boolean    Ask for a crate version before browsing (default false, uses latest). Use select_version keymap to change it later.
 ---@field pinned_crates string[]    Crates to always show at the top of the source picker.
 
 ---@class RustDocs.Keymaps
 ---@field open string               Keymap to open the picker (respects session memory)
 ---@field clear_source string       Keymap to forget the remembered crate and open the source picker
 ---@field open_crate_index string   Keymap (inside item picker) to open the crate's top-level index page
----@field go_to_doc string          Buffer-local: follow link under cursor to its doc page
+---@field select_version string     Keymap (inside item picker, crates only) to pick another version
+---@field go_to_doc string          Buffer-local: follow link in current window
+---@field follow_link string        Buffer-local: follow link in current window (default <CR>)
+---@field follow_link_split string  Buffer-local: follow link in horizontal split
+---@field follow_link_vsplit string Buffer-local: follow link in vertical split
 ---@field section_next string       Jump to next section in doc buffer
 ---@field section_prev string       Jump to previous section in doc buffer
 ---@field open_browser string       Open current doc in browser
@@ -26,7 +30,7 @@ M.defaults = {
   picker = "auto",
   open_mode = "current",
   index_ttl = 60 * 60 * 24 * 7, -- 1 week
-  prompt_version = true,
+  prompt_version = false,
   pinned_crates = {},
   keymaps = {
     -- Global: open picker (re-uses remembered source if set)
@@ -34,9 +38,16 @@ M.defaults = {
     -- Picker-local: forget remembered source and re-open the source picker
     clear_source     = "<C-b>",
     -- Picker-local: open the crate's root index page without picking an item
-    open_crate_index = "<C-e>",
+    open_crate_index = "<C-o>",
+    -- Picker-local (crates only): open the version picker for the current crate
+    select_version   = "<C-e>",
     -- Buffer-local: follow the link on the current line to its doc page
     go_to_doc        = "gd",
+    -- Buffer-local: same as go_to_doc (current window)
+    follow_link        = "<CR>",
+    -- Buffer-local: follow link in a split
+    follow_link_split  = "<C-s>",
+    follow_link_vsplit = "<C-v>",
     -- Buffer-local navigation
     section_next     = "]]",
     section_prev     = "[[",

@@ -44,34 +44,45 @@ use {
 
 | Command / Keymap    | Action                                                          |
 |---------------------|-----------------------------------------------------------------|
-| `<leader>rd`        | Open picker — jumps straight to items if a source is remembered |
+| `<leader>rd`        | Open picker — std items by default, remembered source after that |
 | `:RustDocs`         | Same as `<leader>rd`                                            |
 | `:RustDocs source`  | Reset session memory and open the source picker                 |
 | `:RustDocs refresh` | Rebuild the std index from local rustdoc, then open             |
 
 ### Session memory
 
-After you pick a source (std or an external crate + version), **rust-docs.nvim
-remembers it for the rest of the Neovim session**. The next time you press
-`<leader>rd` the source picker is skipped and you land directly in the item
-fuzzy-finder, already scoped to your crate.
+**rust-docs.nvim defaults to `std`** — the first `<leader>rd` lands directly
+in the std item fuzzy-finder. After you pick a source (std or an external
+crate + version), it is remembered for the rest of the Neovim session and the
+next `<leader>rd` goes straight back to it.
 
 Use `<C-b>` **inside the item picker** (or `:RustDocs source`) whenever you
 want to switch to a different crate or back to `std`.
 
+Use `<C-e>` **inside the item picker** (crates only) to open the version picker
+and switch to a different version of the current crate.
+
 ### Flow
 
-1. **First open** — `<leader>rd` shows the source picker (std / pinned crates /
-   Search crates.io…). After picking, the source is remembered.
+1. **First open** — `<leader>rd` goes directly to the std item picker.
+   Press `<C-b>` inside it to open the source picker (pinned crates /
+   Search crates.io…). Picking a crate uses its latest version automatically
+   (no version prompt). After picking, the source is remembered.
 2. **Subsequent opens** — `<leader>rd` goes directly to the item picker for the
    remembered source. The picker title shows the active crate and version.
 3. **Switch source** — press `<C-b>` from within the item picker to forget the
    memory and show the source picker.
+4. **Switch version** — press `<C-e>` from within a crate item picker to open
+   the version picker (set `prompt_version = true` in setup to always prompt).
 
 ### Inside the item picker
 
 Items are ordered by kind (types first, callables last), then alphabetically
 within each kind. Fuzzy scoring takes over as you type.
+
+Kind words count for the search: typing `read trait`, `vec struct` or
+`[trait] read` filters to that kind, so you don't have to guess the exact
+item name first.
 
 | Key     | Action                                       |
 |---------|----------------------------------------------|
@@ -80,11 +91,14 @@ within each kind. Fuzzy scoring takes over as you type.
 | `<C-v>` | Open in vertical split                       |
 | `<C-t>` | Open in new tab                              |
 | `<C-b>` | Forget remembered source, open source picker |
-| `<C-e>` | Open the crate's root index page (no item)   |
+| `<C-e>` | Pick another version (crates only)           |
+| `<C-o>` | Open the crate's root index page (no item)   |
 
-`<C-e>` is only shown in the picker title and only active when browsing an
-external crate (not std). `<C-b>` is also only active inside the item picker,
-not globally.
+`<C-o>` is only shown in the picker title and only active when browsing an
+external crate (not std). `<C-e>` is only active for crates. `<C-b>` is also
+only active inside the item picker, not globally. The active shortcuts are
+always shown as hints in the picker title, e.g.
+`Rust Docs — serde_json latest  [<C-e>] versions  [<C-o>] index  [<C-b>] sources`.
 
 When using Telescope, all standard actions work as expected — including sending
 results to the quickfix list (`<C-q>` / `<M-q>`).
@@ -96,20 +110,32 @@ The buffer is rendered as Markdown. Top-level sections (`# Signature`,
 description, any sub-headings from the original rustdoc page are preserved as
 `##` / `###`. Impl block headers appear as `##` subheadings.
 
-| Key  | Action                       |
-|------|------------------------------|
-| `]]` | Jump to next heading         |
-| `[[` | Jump to previous heading     |
-| `gx` | Open current doc in browser  |
-| `gd` | Follow link under cursor     |
-| `R`  | Reload / re-fetch this page  |
-| `q`  | Close the buffer             |
+| Key  | Action                                    |
+|------|-------------------------------------------|
+| `]]` | Jump to next heading                      |
+| `[[` | Jump to previous heading                  |
+| `gx` | Open current doc in browser               |
+| `gd` | Follow link in current window             |
+| `<CR>` | Follow link in current window           |
+| `<C-s>` | Follow link in horizontal split         |
+| `<C-v>` | Follow link in vertical split           |
+| `R`  | Reload / re-fetch this page               |
+| `q`  | Close the buffer                          |
+
+Navigable words (TOC entries, module items, implementors — anything `<CR>`/`gd`
+can follow) are underlined via the `RustDocsLink` highlight group. Only the
+word itself is highlighted; jumping works from anywhere on its line.
+Override the look, e.g. `:hi RustDocsLink guifg=#7aa2f7 gui=underline`.
 
 `]]` / `[[` navigate across all heading levels (`#`, `##`, `###`).
 
-Folds are enabled automatically (`foldmethod=expr`) using the Treesitter
-markdown fold expression. All folds start open (`foldlevel=99`). Use `za` to
-toggle a section fold.
+Folds use the standard treesitter markdown folds (`vim.treesitter.foldexpr()`).
+All folds start open (`foldlevel=99`). Use `za` to toggle a section fold.
+
+Doc buffers use the plain `markdown` filetype (named `rust-docs://…`), so
+render-markdown.nvim, treesitter highlighting, conceal settings, and your own
+markdown autocmds behave exactly as in any other markdown file — including
+`:RenderMarkdown toggle`.
 
 ## Configuration
 
@@ -122,8 +148,9 @@ require("rust-docs").setup({
   open_mode = "current",
 
   -- When true, show a version picker before loading an external crate's items.
-  -- When false, always use the latest stable version automatically.
-  prompt_version = true,
+  -- When false (default), always use the latest version automatically.
+  -- Use the `select_version` keymap inside the item picker to switch versions later.
+  prompt_version = false,
 
   -- Crates that always appear at the top of the source picker (by crate name).
   -- Example: pinned_crates = { "serde", "tokio", "anyhow" }
@@ -135,9 +162,16 @@ require("rust-docs").setup({
     -- Picker-local: forget remembered source and re-open the source picker
     clear_source     = "<C-b>",
     -- Picker-local: open the crate's root index page without picking an item
-    open_crate_index = "<C-e>",
+    open_crate_index = "<C-o>",
+    -- Picker-local (crates only): open the version picker for the current crate
+    select_version   = "<C-e>",
     -- Buffer-local: follow a link under the cursor to its doc page
-    go_to_doc        = "gd",
+    go_to_doc          = "gd",
+    -- Buffer-local: same as go_to_doc (current window, "" disables)
+    follow_link        = "<CR>",
+    -- Buffer-local: follow link in a split ("" disables)
+    follow_link_split  = "<C-s>",
+    follow_link_vsplit = "<C-v>",
     -- Buffer-local navigation
     section_next     = "]]",
     section_prev     = "[[",

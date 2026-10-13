@@ -13,9 +13,17 @@ local function is_heading(line)
   return line ~= nil and line:match("^#+ ")
 end
 
---- Module-level cache: buf_number → link_map ({ [line_nr] = url })
+--- Module-level cache: buf_number → link spans ({ [line_nr] = { url, c0, c1 } })
+--- c0/c1 are 0-based byte columns (end-exclusive) for the navigable word.
 --- Using a plain Lua table so integer keys are preserved (vim.b doesn't allow that).
 local buf_link_maps = {}
+
+--- Namespace for navigable-word highlights (see write_lines).
+local LINK_NS = vim.api.nvim_create_namespace("rust-docs-links")
+
+-- Underline for the navigable word that <CR>/gd can follow.
+-- User-overridable: :hi RustDocsLink guifg=... etc.
+pcall(vim.api.nvim_set_hl, 0, "RustDocsLink", { link = "Underlined", default = true })
 
 --- Return the buffer name for an item.
 ---@param full_path string  e.g. "std::net::TcpListener"
@@ -95,22 +103,137 @@ local function set_keymaps(buf, url)
     vim.notify("rust-docs: opened in browser", vim.log.levels.INFO)
   end, vim.tbl_extend("force", opts, { desc = "rust-docs: open in browser" }))
 
-  -- Follow link under cursor (gd, configurable)
-  local go_key = km.go_to_doc or "gd"
-  vim.keymap.set("n", go_key, function()
+  -- Helper to find an anchor heading within the buffer
+  local function find_anchor_line(b, anchor)
+    local lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+    local start_i = 1
+    for i, line in ipairs(lines) do
+      if i > 5 and line:match("^# ") and not line:match("^# Table of Contents") then
+        start_i = i
+        break
+      end
+    end
+
+    local is_method = anchor:match("^#?method%.") or anchor:match("^#?tymethod%.")
+    local is_type   = anchor:match("^#?associatedtype%.")
+    local is_const  = anchor:match("^#?associatedconstant%.")
+    local clean     = anchor:gsub("^#", ""):gsub("^method%.", ""):gsub("^tymethod%.", ""):gsub("^associatedtype%.", ""):gsub("^associatedconstant%.", ""):gsub("%-", " "):lower()
+
+    for i = start_i, #lines do
+      local line = lines[i]
+      if line:match("^#+") then
+        local heading = line:gsub("^#+%s*", ""):lower()
+        if is_method then
+          if heading:match("^fn%s+" .. clean .. "$") or heading:match("^fn%s+" .. clean .. "%f[%W]") then
+            return i
+          end
+        elseif is_type then
+          if heading:match("^type%s+" .. clean .. "$") or heading:match("^type%s+" .. clean .. "%f[%W]") then
+            return i
+          end
+        elseif is_const then
+          if heading:match("^const%s+" .. clean .. "$") or heading:match("^const%s+" .. clean .. "%f[%W]") then
+            return i
+          end
+        else
+          if heading == clean then
+            return i
+          end
+        end
+      end
+    end
+
+    for i = start_i, #lines do
+      local line = lines[i]
+      if line:match("^#+") then
+        local heading = line:gsub("^#+%s*", ""):lower()
+        if heading:find(clean, 1, true) then
+          return i
+        end
+      end
+    end
+
+    return nil
+  end
+
+  -- Derive a display name from a target URL
+  local function display_name_from_url(target_url)
+    local clean = target_url:gsub("^https?://[^/]+/", ""):gsub("%.html$", ""):gsub("[?#].*", "")
+    clean = clean:gsub("/index$", "")
+    local parts = {}
+    for p in clean:gmatch("[^/]+") do
+      table.insert(parts, p)
+    end
+    -- For docs.rs URLs (e.g. crate/version/crate/...)
+    if #parts >= 3 and parts[1] == parts[3] then
+      table.remove(parts, 2)
+    end
+    if #parts >= 2 and parts[1] == parts[2] then
+      table.remove(parts, 1)
+    end
+    -- Clean rustdoc item kind prefixes (e.g. struct.File -> File)
+    if #parts > 0 then
+      parts[#parts] = parts[#parts]:gsub("^(%a+)%.", "")
+    end
+    return table.concat(parts, "::")
+  end
+
+  local function follow_link(mode)
+    mode = mode or "current"
     local cur_line = vim.api.nvim_win_get_cursor(0)[1]
     local lmap = buf_link_maps[buf]
-    local target_url = lmap and lmap[cur_line]
-    if not target_url then
+    local entry = lmap and lmap[cur_line]
+    -- Back-compat: older buffers stored a plain string per line
+    if type(entry) == "string" then
+      entry = { url = entry }
+    end
+    if not entry or not entry.url then
       vim.notify("rust-docs: no link on this line", vim.log.levels.INFO)
       return
     end
-    -- Derive a display name from the URL path (last two segments)
-    local display = target_url:match("/([^/]+/[^/]+)$") or target_url:match("/([^/]+)$") or target_url
-    -- Strip trailing .html
-    display = display:gsub("%.html$", ""):gsub("/", "::")
-    M.open_url(target_url, display)
-  end, vim.tbl_extend("force", opts, { desc = "rust-docs: follow link to doc page" }))
+    -- Single link per line: jump regardless of cursor column.
+    -- The underline only marks the navigable word.
+    local target_url = entry.url
+
+    if target_url:match("^#") then
+      local line_nr = find_anchor_line(buf, target_url)
+      if line_nr then
+        vim.api.nvim_win_set_cursor(0, { line_nr, 0 })
+        return
+      end
+      vim.notify("rust-docs: section anchor not found: " .. target_url, vim.log.levels.INFO)
+      return
+    end
+
+    local display = display_name_from_url(target_url)
+    if mode == "current" then
+      M.open_url(target_url, display)
+    else
+      local orig_mode = config.options.open_mode
+      config.options.open_mode = mode
+      M.open_url(target_url, display)
+      config.options.open_mode = orig_mode
+    end
+  end
+
+  -- Follow link (current window via gd / <CR> by default)
+  local go_key = km.go_to_doc or "gd"
+  if go_key ~= "" then
+    vim.keymap.set("n", go_key, function() follow_link("current") end, vim.tbl_extend("force", opts, { desc = "rust-docs: follow link" }))
+  end
+  local confirm_key = km.follow_link or "<CR>"
+  if confirm_key ~= "" and confirm_key ~= go_key then
+    vim.keymap.set("n", confirm_key, function() follow_link("current") end, vim.tbl_extend("force", opts, { desc = "rust-docs: follow link" }))
+  end
+  -- Same link in a split: horizontal / vertical (configurable, "" disables)
+  local split_key = km.follow_link_split or "<C-s>"
+  if split_key ~= "" then
+    vim.keymap.set("n", split_key, function() follow_link("split") end, vim.tbl_extend("force", opts, { desc = "rust-docs: follow link in split" }))
+  end
+  local vsplit_key = km.follow_link_vsplit or "<C-v>"
+  if vsplit_key ~= "" then
+    vim.keymap.set("n", vsplit_key, function() follow_link("vsplit") end, vim.tbl_extend("force", opts, { desc = "rust-docs: follow link in vsplit" }))
+  end
 
   -- Reload (re-fetch)
   vim.keymap.set("n", "R", function()
@@ -126,7 +249,7 @@ end
 --- Write lines into the buffer and update the link map.
 ---@param buf integer
 ---@param lines string[]
----@param link_map table<integer,string>|nil
+---@param link_map table<integer,{url:string,c0:integer,c1:integer}|string>|nil
 local function write_lines(buf, lines, link_map)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -134,6 +257,31 @@ local function write_lines(buf, lines, link_map)
   vim.bo[buf].modified   = false
   -- Update the link map (clear old, set new)
   buf_link_maps[buf] = link_map or {}
+  -- Highlight only the navigable word so it is discoverable
+  if vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_clear_namespace, buf, LINK_NS, 0, -1)
+    if link_map then
+      for ln, entry in pairs(link_map) do
+        local url, c0, c1
+        if type(entry) == "string" then
+          url, c0, c1 = entry, 0, #lines[ln]
+        elseif type(entry) == "table" then
+          url, c0, c1 = entry.url, entry.c0, entry.c1
+        end
+        if type(ln) == "number" and url and ln >= 1 and ln <= #lines then
+          local line_len = #lines[ln]
+          c0 = math.max(0, math.min(c0 or 0, line_len))
+          c1 = math.max(c0, math.min(c1 or line_len, line_len))
+          if c1 > c0 then
+            pcall(vim.api.nvim_buf_set_extmark, buf, LINK_NS, ln - 1, c0, {
+              end_col = c1,
+              hl_group = "RustDocsLink",
+            })
+          end
+        end
+      end
+    end
+  end
 end
 
 --- Create a new doc buffer (not yet populated).
@@ -144,19 +292,27 @@ local function create_buf(name, url)
   local buf = vim.api.nvim_create_buf(true, false)  -- buflisted=true, scratch=false
   vim.api.nvim_buf_set_name(buf, name)
 
-  -- Buffer options
-  vim.bo[buf].filetype    = "rust-docs"
-  vim.bo[buf].syntax      = "markdown"
+  -- Buffer options.
+  -- NOTE: filetype is plain `markdown` (not a custom one) so that everything
+  -- behaves exactly like in any other markdown file: treesitter highlighting,
+  -- render-markdown.nvim (`:RenderMarkdown toggle`), conceal settings, and
+  -- the user's own markdown autocmds. The buffer is still identifiable by its
+  -- `rust-docs://…` name and `b:rust_docs_url`.
+  vim.bo[buf].filetype    = "markdown"
   vim.bo[buf].buftype     = "nofile"
   vim.bo[buf].swapfile    = false
   vim.bo[buf].modifiable  = false
   vim.bo[buf].readonly    = false  -- we manage modifiable manually
   vim.bo[buf].buflisted   = true
 
-  -- Enable markdown-heading folds (window-local, set when buffer is displayed)
+  -- Markdown folds via treesitter (sections, lists, code blocks).
+  -- NOTE: no `once = true` here — window options must be (re-)applied every
+  -- time the buffer is displayed (splits, re-visits), otherwise the new
+  -- window keeps whatever options the previously shown buffer had.
+  -- Conceal is deliberately left alone so render-markdown.nvim and friends
+  -- behave exactly as in other markdown buffers.
   vim.api.nvim_create_autocmd("BufWinEnter", {
     buffer  = buf,
-    once    = true,
     callback = function()
       for _, win in ipairs(vim.fn.win_findbuf(buf)) do
         vim.wo[win].foldmethod = "expr"
@@ -217,15 +373,26 @@ function M.open_url(url, display_name)
 
   write_lines(buf, { "# " .. display_name, "", "Loading " .. url .. " …" })
 
-  fetch.fetch(url, function(err, html)
+  fetch.fetch(url, function(err, html, sidebar_data, final_url)
     if err then
       write_lines(buf, { "# Error", "", err, "", "Press R to retry." })
       return
     end
-    local ok, lines, link_map = pcall(render.render, html, url)
+    if not html or html == "" then
+      write_lines(buf, { "# Error", "", "rust-docs: empty response for " .. url, "", "Press R to retry." })
+      return
+    end
+    -- If docs.rs redirected (meta refresh), remember the final URL for gx/R
+    local render_url = final_url or url
+    vim.b[buf].rust_docs_url = render_url
+    local ok, lines, link_map = pcall(render.render, html, render_url, sidebar_data)
     if not ok then
       -- pcall packs error into `lines` when it fails
       write_lines(buf, { "# Render error", "", tostring(lines) })
+      return
+    end
+    if #lines <= 5 then
+      write_lines(buf, { "# Error", "", "rust-docs: could not parse content from " .. render_url, "", "Press gx to open in browser." })
       return
     end
     write_lines(buf, lines, link_map)
@@ -262,7 +429,7 @@ function M.open(item)
   show_loading(buf, item)
 
   -- Fetch the doc page
-  fetch.fetch(item.url, function(err, html)
+  fetch.fetch(item.url, function(err, html, sidebar_data, final_url)
     if err then
       write_lines(buf, {
         "# Error loading " .. item.full_path,
@@ -274,7 +441,20 @@ function M.open(item)
       return
     end
 
-    local ok, lines, link_map = pcall(render.render, html, item.url)
+    if not html or html == "" then
+      write_lines(buf, {
+        "# Error loading " .. item.full_path,
+        "",
+        "rust-docs: empty response for " .. item.url,
+        "",
+        "Press R to retry.",
+      })
+      return
+    end
+
+    local render_url = final_url or item.url
+    vim.b[buf].rust_docs_url = render_url
+    local ok, lines, link_map = pcall(render.render, html, render_url, sidebar_data)
     if not ok then
       write_lines(buf, {
         "# Render error for " .. item.full_path,
@@ -304,12 +484,14 @@ function M.reload(buf)
 
   write_lines(buf, { "Reloading...", "", url })
 
-  fetch.fetch(url, function(err, html)
+  fetch.fetch(url, function(err, html, sidebar_data, final_url)
     if err then
       write_lines(buf, { "Error: " .. err })
       return
     end
-    local ok, lines, link_map = pcall(render.render, html, url)
+    local render_url = final_url or url
+    vim.b[buf].rust_docs_url = render_url
+    local ok, lines, link_map = pcall(render.render, html, render_url, sidebar_data)
     if not ok then
       write_lines(buf, { "Render error: " .. tostring(lines) })
       return

@@ -606,7 +606,8 @@ end
 
 --- Search items for an external crate by fuzzy-filtering the cached item list.
 --- Downloads+parses the rustdoc JSON on first call (same as get_crate_items),
---- then does a simple case-insensitive substring filter over name/full_path/desc.
+--- then does a simple case-insensitive substring filter over name/full_path/desc/kind.
+--- Kind words in the query (e.g. "read trait") filter by item kind.
 --- Results are limited to 50 to match the std search engine limit.
 ---
 ---@param name string
@@ -634,28 +635,59 @@ function M.search_items(name, version, query, callback)
       return
     end
 
-    local q = query:lower()
+    local kinds = require("rust-docs.search.kinds")
+    local remainder, kind_groups = kinds.split(query)
+
+    local tokens = {}
+    for tok in remainder:lower():gmatch("%S+") do
+      table.insert(tokens, tok)
+    end
+    local q = table.concat(tokens, " ")
     local matched = {}
 
-    -- Score: 0 = name starts-with, 1 = name contains, 2 = path contains, 3 = desc contains
+    -- Score: 0 = name equals, 1 = name starts-with, 2 = name contains,
+    --        3 = path contains, 4 = desc contains, 5 = kind contains.
+    -- Every text token must appear in at least one of name/path/desc/kind,
+    -- and the item kind must satisfy any requested kind groups.
     for _, item in ipairs(items) do
-      local name_lc = (item.name or ""):lower()
-      local path_lc = (item.full_path or ""):lower()
-      local desc_lc = (item.desc or ""):lower()
-      local score
-      if name_lc == q then
-        score = 0
-      elseif name_lc:sub(1, #q) == q then
-        score = 1
-      elseif name_lc:find(q, 1, true) then
-        score = 2
-      elseif path_lc:find(q, 1, true) then
-        score = 3
-      elseif desc_lc:find(q, 1, true) then
-        score = 4
-      end
-      if score then
-        table.insert(matched, { score = score, item = item })
+      if kinds.kind_matches(item.kind, kind_groups) then
+        local name_lc = (item.name or ""):lower()
+        local path_lc = (item.full_path or ""):lower()
+        local desc_lc = (item.desc or ""):lower()
+        local kind_lc = (item.kind or ""):lower()
+
+        local all_tokens_match = true
+        for _, t in ipairs(tokens) do
+          if not (name_lc:find(t, 1, true)
+            or path_lc:find(t, 1, true)
+            or desc_lc:find(t, 1, true)
+            or kind_lc:find(t, 1, true)) then
+            all_tokens_match = false
+            break
+          end
+        end
+
+        if all_tokens_match then
+          local score
+          if name_lc == q then
+            score = 0
+          elseif name_lc:sub(1, #q) == q then
+            score = 1
+          elseif name_lc:find(q, 1, true) then
+            score = 2
+          elseif path_lc:find(q, 1, true) then
+            score = 3
+          elseif desc_lc:find(q, 1, true) then
+            score = 4
+          elseif kind_lc:find(q, 1, true) then
+            score = 5
+          else
+            -- Multi-word query: tokens match individually but not as a
+            -- contiguous string (e.g. "read to string" vs "read_to_string").
+            score = 6
+          end
+          table.insert(matched, { score = score, item = item })
+        end
       end
     end
 

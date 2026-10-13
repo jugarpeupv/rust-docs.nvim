@@ -71,8 +71,8 @@ end
 -- ---------------------------------------------------------------------------
 
 --- Open the items picker for an external crate.
---- Skips the version picker if a version is already remembered or if
---- prompt_version = false.
+--- Uses "latest" unless a version is already remembered, prompt_version = true,
+--- or a forced_version is passed.
 ---@param crate RustDocs.Crate
 ---@param forced_version string|nil  Pass a version to skip the picker
 function M.open_crate(crate, forced_version)
@@ -109,6 +109,39 @@ function M.open_crate(crate, forced_version)
       return
     end
 
+    local backend = detect_picker()
+    if backend == "telescope" then
+      require("rust-docs.pickers.telescope").open_version(crate, versions, load_version)
+    elseif backend == "snacks" then
+      require("rust-docs.pickers.snacks").open_version(crate, versions, load_version)
+    end
+  end)
+end
+
+--- Open the version picker for the currently active crate source.
+--- Used by the `select_version` keymap inside the item picker.
+--- On selection, remembers the new version and re-opens the item picker.
+function M.select_version()
+  local src = M._last_source
+  if not src or src.kind ~= "crate" then
+    vim.notify("rust-docs: version picker is only available for crates", vim.log.levels.INFO)
+    return
+  end
+  local crate = src.crate
+  local crate_mod = require("rust-docs.search.crates")
+  crate_mod.get_versions(crate.name, function(err, versions)
+    if err or not versions or #versions == 0 then
+      vim.notify(
+        "rust-docs: could not fetch versions for " .. crate.name,
+        vim.log.levels.WARN
+      )
+      return
+    end
+    local function load_version(version)
+      M._last_source = { kind = "crate", crate = crate, version = version }
+      local index_url = "https://docs.rs/" .. crate.name .. "/" .. version .. "/" .. crate.name .. "/"
+      open_live_picker(M._last_source, index_url)
+    end
     local backend = detect_picker()
     if backend == "telescope" then
       require("rust-docs.pickers.telescope").open_version(crate, versions, load_version)
@@ -171,14 +204,16 @@ end
 -- Main entry point (respects session memory)
 -- ---------------------------------------------------------------------------
 
---- Open rust-docs. If a source is remembered from this session, jump directly
---- to the item picker for that source. Otherwise show the source picker.
+--- Open rust-docs. Defaults to std on first use; press <C-b> (clear_source)
+--- inside the item picker to switch to another source.
+--- The chosen source is remembered for the rest of the session.
 function M.open()
   local src = M._last_source
 
   if src == nil then
-    -- No memory yet — show source picker
-    M.open_source_picker()
+    -- No memory yet — default to std (use <C-b> in the picker for other sources)
+    M._last_source = { kind = "std" }
+    open_live_picker(M._last_source, nil)
     return
   end
 

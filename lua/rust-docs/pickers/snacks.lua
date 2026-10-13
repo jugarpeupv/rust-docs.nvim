@@ -261,7 +261,8 @@ function M.open(source, title, index_url)
   local index          = require("rust-docs.search.index")
   local buffer         = require("rust-docs.render.buffer")
   local cfg            = require("rust-docs.config").options
-  local open_index_key = cfg.keymaps.open_crate_index or "<C-e>"
+  local open_index_key = cfg.keymaps.open_crate_index or "<C-o>"
+  local version_key    = cfg.keymaps.select_version or "<C-e>"
   local clear_src_key  = cfg.keymaps.clear_source
   local DEBOUNCE_MS    = 200
 
@@ -331,10 +332,29 @@ function M.open(source, title, index_url)
     key_defs[open_index_key] = { "open_crate_index", mode = { "i", "n" } }
   end
 
+  local is_crate = source and source.kind == "crate"
+  if is_crate and version_key and version_key ~= "" then
+    actions.select_version = function(picker, _entry)
+      picker:close()
+      require("rust-docs").select_version()
+    end
+    key_defs[version_key] = { "select_version", mode = { "i", "n" } }
+  end
+
+  local hint_parts = {}
+  if is_crate and version_key and version_key ~= "" then
+    table.insert(hint_parts, "[" .. version_key .. "] versions")
+  end
+  if index_url and open_index_key and open_index_key ~= "" then
+    table.insert(hint_parts, "[" .. open_index_key .. "] index")
+  end
+  if clear_src_key and clear_src_key ~= "" then
+    table.insert(hint_parts, "[" .. clear_src_key .. "] sources")
+  end
+  local hints_suffix = #hint_parts > 0 and ("  " .. table.concat(hint_parts, "  ")) or ""
+
   snacks.picker({
-    title  = index_url
-      and (title or "Rust Docs") .. "  [" .. open_index_key .. "] Open index page"
-      or  (title or "Rust Docs"),
+    title  = (title or "Rust Docs") .. hints_suffix,
 
     -- `source(filter, cb)` is called by Snacks on every filter change.
     -- We debounce here and delegate to index.search().

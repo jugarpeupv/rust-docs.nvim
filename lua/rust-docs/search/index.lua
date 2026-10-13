@@ -266,6 +266,11 @@ end
 --- For std: calls the Node.js rustdoc search engine.
 --- For crates: delegates to the crates module (which uses docs.rs JSON).
 ---
+--- Kind words in the query (e.g. "read trait", "vec struct", "[trait] read")
+--- are stripped before calling the engine — the engine treats "read trait" as
+--- a single literal query and returns nothing — and results are then filtered
+--- to the requested kinds.
+---
 ---@param query string
 ---@param source { kind: "std" } | { kind: "crate", crate: RustDocs.Crate, version: string }
 ---@param callback fun(err: string|nil, items: RustDocs.Item[]|nil)
@@ -273,7 +278,24 @@ function M.search(query, source, callback)
   if source.kind == "std" then
     -- Filter to the main std/alloc/core crates to avoid noise from core::arch etc.
     -- Pass no filter to search all crates in the std toolchain.
-    run_std_search(query, nil, callback)
+    local kinds = require("rust-docs.search.kinds")
+    local engine_query, kind_groups = kinds.split(query)
+    run_std_search(engine_query, nil, function(err, items)
+      if err then
+        callback(err, nil)
+        return
+      end
+      if kind_groups and #kind_groups > 0 and items then
+        local filtered = {}
+        for _, item in ipairs(items) do
+          if kinds.kind_matches(item.kind, kind_groups) then
+            table.insert(filtered, item)
+          end
+        end
+        items = filtered
+      end
+      callback(nil, items)
+    end)
   elseif source.kind == "crate" then
     require("rust-docs.search.crates").search_items(
       source.crate.name, source.version, query, callback

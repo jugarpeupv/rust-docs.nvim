@@ -270,7 +270,7 @@ end
 --- Results are already ranked by rustdoc; no custom sorter is applied.
 ---@param source { kind: "std" } | { kind: "crate", crate: RustDocs.Crate, version: string }
 ---@param title string          Picker title
----@param index_url string|nil  If set, <C-e> opens this URL as the crate index page
+---@param index_url string|nil  If set, open_crate_index keymap opens this URL as the crate index page
 function M.open(source, title, index_url)
   local t = require_telescope()
   if not t then return end
@@ -278,7 +278,8 @@ function M.open(source, title, index_url)
   local index          = require("rust-docs.search.index")
   local buffer         = require("rust-docs.render.buffer")
   local cfg            = require("rust-docs.config").options
-  local open_index_key = cfg.keymaps.open_crate_index or "<C-e>"
+  local open_index_key = cfg.keymaps.open_crate_index or "<C-o>"
+  local version_key    = cfg.keymaps.select_version or "<C-e>"
   local clear_src_key  = cfg.keymaps.clear_source
   local DEBOUNCE_MS    = 200
 
@@ -342,11 +343,24 @@ function M.open(source, title, index_url)
     end)
   end
 
+  -- Build keymap hint strings for the picker titles so all
+  -- item-picker shortcuts are visible without opening help.
+  local is_crate = source and source.kind == "crate"
+  local hint_parts = {}
+  if is_crate and version_key and version_key ~= "" then
+    table.insert(hint_parts, "[" .. version_key .. "] versions")
+  end
+  if index_url and open_index_key and open_index_key ~= "" then
+    table.insert(hint_parts, "[" .. open_index_key .. "] index")
+  end
+  if clear_src_key and clear_src_key ~= "" then
+    table.insert(hint_parts, "[" .. clear_src_key .. "] sources")
+  end
+  local hints_suffix = #hint_parts > 0 and ("  " .. table.concat(hint_parts, "  ")) or ""
+
   picker_ref = t.pickers.new({}, {
-    prompt_title   = index_url
-      and (title or "Rust Docs") .. "  [" .. open_index_key .. "] Open index page"
-      or  (title or "Rust Docs"),
-    results_title  = "Items  (type to search)",
+    prompt_title   = (title or "Rust Docs") .. hints_suffix,
+    results_title  = "Items — <CR> open · <C-s>/<C-v>/<C-t> split · type to search",
     -- Start empty; results arrive async after first search fires.
     finder    = items_to_finder({}),
     -- Pass-through sorter: results are already ranked by the rustdoc engine.
@@ -457,6 +471,16 @@ function M.open(source, title, index_url)
         end
         map("i", open_index_key, open_index)
         map("n", open_index_key, open_index)
+      end
+
+      -- Open the version picker for the current crate (crates only)
+      if is_crate and version_key and version_key ~= "" then
+        local function open_versions()
+          t.actions.close(prompt_buf)
+          require("rust-docs").select_version()
+        end
+        map("i", version_key, open_versions)
+        map("n", version_key, open_versions)
       end
 
       return true
