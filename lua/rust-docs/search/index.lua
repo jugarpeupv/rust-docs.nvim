@@ -162,33 +162,52 @@ end
 -- ---------------------------------------------------------------------------
 
 --- Convert a raw JSON result item from rustdoc_search.js to RustDocs.Item.
----@param r table  raw JSON item: {name, path, kind, desc, href}
+---@param r table  raw JSON item: {name, path, displayPath, kind, desc, href}
 ---@return RustDocs.Item
 local function to_item(r)
   local name      = r.name or ""
   local mod_path  = r.path or ""
+  local disp_pref = r.displayPath or ""
   local kind      = r.kind or ""
   local desc      = r.desc or ""
   local href      = r.href or ""
 
-  -- Build full_path from path + name
+  -- Build full_path the same way the website displays it: the displayPath
+  -- prefix already contains the module path plus the parent type for
+  -- associated items (e.g. "std::io::Stdin::" + "read_line").
+  -- This also disambiguates same-named methods on different types.
   local full_path
-  if mod_path == "" then
+  if disp_pref ~= "" then
+    if disp_pref:sub(-2) == "::" then
+      full_path = disp_pref .. name
+    else
+      full_path = disp_pref .. "::" .. name
+    end
+  elseif mod_path == "" then
     full_path = name
   else
     full_path = mod_path .. "::" .. name
   end
+
+  -- The engine returns desc as HTML; strip tags/entities to match web text.
+  desc = desc:gsub("<[^>]+>", "")
+  desc = desc:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&")
+  desc = desc:gsub("&quot;", '"'):gsub("&#39;", "'"):gsub("&nbsp;", " ")
 
   -- Build URL
   local url
   if href ~= "" then
     url = href_to_url(href, base_doc_url())
   else
-    -- Fallback: build from parts
+    -- Fallback: build from the module path (not full_path, which may
+    -- include a parent type that has no corresponding URL segment).
     local parts = {}
-    for p in full_path:gmatch("[^:]+") do
-      table.insert(parts, p)
+    if mod_path ~= "" then
+      for p in mod_path:gmatch("[^:]+") do
+        table.insert(parts, p)
+      end
     end
+    table.insert(parts, name)
     url = build_url(parts, kind)
   end
 

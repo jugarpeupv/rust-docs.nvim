@@ -10,6 +10,9 @@
  *
  * Output: a JSON array written to stdout, one line per item:
  *   [{"name":"Vec","path":"std::vec","kind":"struct","desc":"...","href":"std/vec/struct.Vec.html"}, ...]
+ *   `displayPath` is the human-readable prefix shown on the website
+ *   (module path plus parent type for associated items, e.g.
+ *   "std::io::Stdin::"), with HTML spans already stripped.
  *
  * Exit codes: 0 = success, 1 = error (message on stderr).
  *
@@ -229,12 +232,16 @@ async function main() {
       ? await item.desc
       : (item.desc || '');
 
-    // item.displayPath contains HTML spans; strip tags to get plain text path
+    // item.displayPath contains HTML spans; strip tags to get the exact
+    // prefix shown on the website (module path + parent type for methods,
+    // e.g. "std::io::Stdin::").
     const rawPath = (item.item.modulePath || '');
+    const rawDisplayPath = (item.displayPath || '').replace(/<[^>]+>/g, '');
 
     items.push({
       name: item.item.name        || '',
       path: rawPath,
+      displayPath: rawDisplayPath,
       kind: item.item.ty          != null ? tyToKind(item.item.ty) : '',
       desc: (desc || '').replace(/\s+/g, ' ').trim(),
       href: item.href             || '',
